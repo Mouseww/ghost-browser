@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace ghost {
 
@@ -69,6 +70,22 @@ struct GpuProfile {
   uint64_t adapter_video_memory = 0;    // -> DXGI_ADAPTER_DESC.DedicatedVideoMemory
 };
 
+// Installed font families, as a fingerprinting page sees them through
+// document.fonts.check() and canvas text measurement.
+//
+// This is the one text surface Track A can actually reach. Canvas pixels and
+// audio samples are produced by Skia and Blink inside the renderer and never
+// cross an OS API, so no OS-level hook can touch them; font enumeration does
+// cross one, because Skia asks DirectWrite which families exist.
+//
+// The list is an allow-list: a family the profile omits is reported as not
+// installed. An empty list disables filtering entirely, which keeps a profile
+// without a `fonts` key a pure pass-through.
+struct FontProfile {
+  std::vector<std::string> families;  // UTF-8 family names, e.g. "Segoe UI"
+  bool has_families = false;
+};
+
 struct Profile {
   std::string profile_id;
   std::string profile_seed_hex;
@@ -77,6 +94,7 @@ struct Profile {
   ScreenProfile screen;
   TimeProfile time;
   GpuProfile gpu;
+  FontProfile fonts;
   std::string user_agent;
   std::string platform;
   int32_t window_width = 0;

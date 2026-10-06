@@ -7,7 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-06
+
+### Added
+
+- **Font enumeration is spoofed.** `document.fonts`, canvas text measurement and
+  font-metric probing all resolve through DirectWrite on Windows, so the shim now
+  hooks `dwrite.dll!DWriteCreateFactory`, replaces the `IDWriteFactory`
+  `GetSystemFontCollection` slot, and filters the `IDWriteFontCollection` it
+  returns down to the profile's `fonts` allow-list. The machine measured here had
+  **266** font families — Office, a Chinese IME pack and a developer's toolchain
+  at once, an unusually loud fingerprint — and a profile now presents the ~89 that
+  a stock Windows install ships. Verified in the renderer: `Arial`, `Segoe UI`,
+  `Times New Roman` and `Bahnschrift` still resolve, while `Cascadia Code`,
+  `Noto Sans SC`, `Ubuntu Mono` and `Agency FB` are gone. A/B controlled: with
+  `GHOST_HOOK_MASK=BF` (every group except fonts) those four come back and the
+  check fails, which is what proves the font hook is the thing removing them.
+  - It is a filter, not a fiction: the visible set is the profile's list
+    intersected with what the OS actually has, so a profile can hide a font but
+    cannot invent one that is not installed.
+  - `FindFamilyName` consults the real collection first and then asks "is that
+    family one we admit?", so a family's localized aliases (`ＭＳ ゴシック` for
+    `MS Gothic`) resolve correctly without matching on the requested string.
+  - If none of the profile's families exist on the host, the hook declines to
+    patch rather than tell the browser the machine has no fonts at all — an empty
+    collection would wreck text rendering far more visibly than an unfiltered one.
+  - Canvas and audio are **not** spoofed and cannot be by this technique: their
+    pixels and samples are produced by Skia and Blink inside the renderer and
+    never cross an OS API for a hook to intercept.
+
 ### Fixed
+
+- **`GHOST_HOOK_MASK` silently disabled every hook when written with a `0x`
+  prefix.** The value is hexadecimal, and `wcstoul(text, nullptr, 16)` parses
+  `"0x3F"` as `0` rather than failing, so the documented spelling of the mask
+  turned all hook groups off. The parser now skips an optional `0x`/`0X` prefix.
 
 - **Window activation was flaky.** Windows refuses `SetForegroundWindow` to a
   process the user is not interacting with, and a single `AttachThreadInput`

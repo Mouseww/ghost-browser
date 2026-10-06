@@ -22,16 +22,17 @@ are only needed for the fingerprint test page under `harness/`.
 | Area | State |
 |---|---|
 | Profile → engine flag/API spoofing | **working** |
-| Native shim (26 hooks, Win32/x64) | **working** |
+| Native shim (27 hooks, Win32/x64) | **working** |
 | Injection into the browser process | **working** |
 | Injection into the GPU process | **working** (needs `--disable-gpu-sandbox`) |
 | Injection into sandboxed renderers | **blocked by the restricted token** |
 | WebGL vendor / renderer (`UNMASKED_*`) | **working** — via DXGI adapter identity |
-| Zero-CDP control plane (`ghost serve`) | **working** — 15 checks |
+| Font enumeration (`document.fonts`, `measureText`) | **working** — DirectWrite collection filtered |
+| Zero-CDP control plane (`ghost serve`) | **working** — 19 checks |
 | Window branding (title, icon, taskbar) | **working** |
 | Reading cookies while the browser runs | **impossible** — Chrome holds the file unshared |
 | Fingerprint coherence harness | **34 checks, 0 failed** |
-| Canvas / Audio / font *metrics* | **not spoofed** (Track A gap) |
+| Canvas / Audio | **not spoofed** (Track A gap — no OS API to hook) |
 | Captcha pipeline (CF, hCaptcha) | **not implemented** |
 | Linux / macOS | **not implemented** |
 
@@ -287,22 +288,30 @@ without giving up the renderer sandbox.
 The correct fix for the renderer side is Track B: patch the engine at build time so nothing
 needs injecting. Track A is the verifier and the transition form.
 
-**2. Canvas, Audio and font *metrics* are still the host's.**
-These live entirely inside Blink/Skia/DSP code with no exported symbol to hook, and the
-official Chrome build ships no PDBs. They are reported as `INFO` by the harness, not `PASS`.
-This is now the largest remaining detection surface — WebGL used to be on this list and no
-longer is.
+**2. Canvas and Audio are still the host's.** Their pixels and samples are produced by
+Skia and Blink's DSP inside the renderer and never cross an OS API, so no hook can reach
+them — not a matter of effort, a matter of there being nothing to intercept. They are
+reported as `INFO` by the harness, not `PASS`. Fonts used to be on this list: font
+*enumeration* does cross an API (DirectWrite), so it is now spoofed, but font *metrics*
+are computed by Skia from the resolved font and remain the host's.
 
-**3. Windows Defender flags the tooling.** `ghost_launch.exe` was quarantined as
+**3. The font filter hides fonts; it cannot invent them.** The visible set is the
+profile's allow-list intersected with what the OS actually has. A profile cannot make a
+machine appear to have a font that is not installed, and if none of the listed families
+exist the hook declines to patch rather than present an empty collection (a browser that
+believes it has no fonts renders text visibly wrong, which is a worse tell than an
+unfiltered list).
+
+**4. Windows Defender flags the tooling.** `ghost_launch.exe` was quarantined as
 `Behavior:Win32/DefenseEvasion.A!ml` after an `icacls /setintegritylevel` experiment (which
 turned out to fix nothing). A clean rebuild is not re-flagged. Shipping this requires code
 signing and a documented exclusion path; CI excludes only its own build-output directory.
 
-**4. The harness is not a detection suite.** `harness/detect.html` measures coherence
+**5. The harness is not a detection suite.** `harness/detect.html` measures coherence
 between the profile and what the page sees. It is not a substitute for running against real
 detection services.
 
-**5. Windows only.** The shim is Win32/x64. The Linux (`LD_PRELOAD`) and macOS
+**6. Windows only.** The shim is Win32/x64. The Linux (`LD_PRELOAD`) and macOS
 (`DYLD_INSERT_LIBRARIES` + ad-hoc re-sign) paths are designed in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) but not implemented.
 
@@ -318,6 +327,7 @@ native/
     src/hooks_display.cpp    screen geometry, DPI
     src/hooks_time.cpp       timezone, locale, registry
     src/hooks_gpu.cpp        DXGI adapter identity (feeds ANGLE's WebGL strings)
+    src/hooks_dwrite.cpp     DirectWrite font collection (document.fonts, measureText)
     src/hooks_proc.cpp       child-process propagation
     src/hook_engine.*        MinHook wrapper
   ghost_launch/            the launcher and injector

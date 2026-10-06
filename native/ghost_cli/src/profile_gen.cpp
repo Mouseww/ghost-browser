@@ -193,6 +193,43 @@ constexpr size_t kZoneCount = sizeof(kZones) / sizeof(kZones[0]);
 constexpr size_t kLocaleCount = sizeof(kLocales) / sizeof(kLocales[0]);
 constexpr size_t kMachineCount = sizeof(kMachines) / sizeof(kMachines[0]);
 
+// The families a stock Windows 10/11 install ships, using the en-US names
+// DirectWrite reports (a family's localized name, "宋体" for SimSun, is resolved
+// by the shim before the allow-list is consulted). Anything outside this list is
+// a fingerprint: a machine claiming a clean en-GB install that also has Office,
+// a Chinese IME pack, or a developer's font collection is trivially singled out,
+// and a real one measured here carried 266 families, not 80.
+//
+// The spoofed set is the intersection of this list with what the host has, so the
+// shim can hide fonts but cannot invent them. That is a real limit: a profile
+// cannot make a machine look like it has a font it lacks.
+const char* const kWindowsFonts[] = {
+    "Arial", "Arial Black", "Bahnschrift", "Calibri", "Calibri Light", "Cambria",
+    "Cambria Math", "Candara", "Candara Light", "Comic Sans MS", "Consolas",
+    "Constantia", "Corbel", "Corbel Light", "Courier New", "Ebrima",
+    "Franklin Gothic Medium", "Gabriola", "Gadugi", "Georgia",
+    "HoloLens MDL2 Assets", "Impact", "Ink Free", "Javanese Text", "Leelawadee UI",
+    "Leelawadee UI Semilight", "Lucida Console", "Lucida Sans Unicode",
+    "Malgun Gothic", "Marlett", "Microsoft Himalaya", "Microsoft JhengHei",
+    "Microsoft JhengHei UI", "Microsoft JhengHei UI Light", "Microsoft New Tai Lue",
+    "Microsoft PhagsPa", "Microsoft Sans Serif", "Microsoft Tai Le",
+    "Microsoft Uighur", "Microsoft YaHei", "Microsoft YaHei UI",
+    "Microsoft YaHei UI Light", "Microsoft Yi Baiti", "MingLiU-ExtB",
+    "MingLiU_HKSCS-ExtB", "Mongolian Baiti", "MS Gothic", "MS PGothic",
+    "MS UI Gothic", "MV Boli", "Myanmar Text", "Nirmala UI",
+    "Nirmala UI Semilight", "Palatino Linotype", "Segoe MDL2 Assets", "Segoe Print",
+    "Segoe Script", "Segoe UI", "Segoe UI Black", "Segoe UI Emoji",
+    "Segoe UI Historic", "Segoe UI Light", "Segoe UI Semibold", "Segoe UI Semilight",
+    "Segoe UI Symbol", "SimSun", "SimSun-ExtB", "SimSun-ExtG", "Sitka Banner",
+    "Sitka Display", "Sitka Heading", "Sitka Small", "Sitka Subheading",
+    "Sitka Text", "Sylfaen", "Symbol", "Tahoma", "Times New Roman", "Trebuchet MS",
+    "Verdana", "Webdings", "Wingdings", "Wingdings 2", "Wingdings 3", "Yu Gothic",
+    "Yu Gothic UI", "Yu Gothic UI Light", "Yu Gothic UI Semibold",
+    "Yu Gothic UI Semilight",
+};
+
+constexpr size_t kFontCount = sizeof(kWindowsFonts) / sizeof(kWindowsFonts[0]);
+
 }  // namespace
 
 std::string iana_for_windows_key(const std::string& key) {
@@ -311,6 +348,14 @@ std::string generate_profile_json(const std::string& id, const std::string& seed
   std::string major = chrome_version.substr(0, chrome_version.find('.'));
   if (major.empty()) major = "0";
 
+  std::string fonts_json;
+  for (size_t i = 0; i < kFontCount; ++i) {
+    if (i != 0) fonts_json += ", ";
+    fonts_json += '"';
+    fonts_json += kWindowsFonts[i];
+    fonts_json += '"';
+  }
+
   char buf[8192];
   std::snprintf(
       buf, sizeof(buf),
@@ -343,7 +388,8 @@ std::string generate_profile_json(const std::string& id, const std::string& seed
       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%s.0.0.0 Safari/537.36\",\n"
       "  \"platform\": \"Win32\",\n"
       "  \"window_width\": %d,\n"
-      "  \"window_height\": %d\n"
+      "  \"window_height\": %d,\n"
+      "  \"fonts\": [%s]\n"
       "}\n",
       id.c_str(), seed_hex.c_str(), m.cores,
       static_cast<unsigned long long>(m.memory_bytes), m.logical_width, m.logical_height,
@@ -354,7 +400,7 @@ std::string generate_profile_json(const std::string& id, const std::string& seed
       m.webgl_vendor, renderer.c_str(), kGlVersion, m.adapter_description,
       m.adapter_vendor_id, m.adapter_device_id,
       static_cast<unsigned long long>(m.adapter_video_memory), major.c_str(), window_width,
-      window_height);
+      window_height, fonts_json.c_str());
   return std::string(buf);
 }
 

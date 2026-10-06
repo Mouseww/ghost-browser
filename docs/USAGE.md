@@ -287,7 +287,8 @@ with a coherent machine preset chosen from the seed:
   "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ... Chrome/154.0.0.0 ...",
   "platform": "Win32",
   "window_width": 1280,
-  "window_height": 800
+  "window_height": 800,
+  "fonts": ["Arial", "Arial Black", "Bahnschrift", "Calibri", "..."],
 }
 ```
 
@@ -311,6 +312,31 @@ The preset table covers twelve real machines (GTX 1650 through RTX 4080, RX 6600
 RX 6700 XT, UHD 630, Iris Xe) with matching core counts, memory, panel sizes,
 device ids and video memory. Editing the JSON by hand is supported; just keep the
 pairs above consistent.
+
+### The `fonts` list
+
+The installed font list is one of the loudest fingerprints a machine has, because
+it is a direct readout of what software is installed. The machine this was built
+on carries **266** families: the stock Windows set, all of Office, a Chinese IME
+pack, and a developer's toolchain (`Cascadia Code`, `Noto Sans SC`,
+`Ubuntu Mono`). Any one of those dates a profile; the combination identifies it.
+
+`fonts` is the allow-list the shim filters DirectWrite down to, and `ghost profile
+new` fills it with the ~89 families a clean Windows install ships. The shim hooks
+`dwrite.dll!DWriteCreateFactory` and the `IDWriteFontCollection` it returns, so
+`document.fonts`, canvas `measureText`, and font-metric probing all agree.
+
+Two limits worth knowing:
+
+- **It hides fonts, it cannot invent them.** The visible set is the profile's list
+  intersected with what the OS actually has. Listing a font you do not have does
+  nothing; it will not appear.
+- **If none of the listed families exist on the host, the hook does not patch at
+  all**, rather than reporting an empty font collection. A browser that believes
+  it has no fonts renders text very visibly wrong, which is a worse signal than an
+  unfiltered list.
+
+Deleting the `fonts` key disables font filtering entirely.
 
 ## 6. Verify it in a real browser
 

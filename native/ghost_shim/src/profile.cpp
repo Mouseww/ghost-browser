@@ -66,11 +66,24 @@ Profile load_from_env() {
   p.window_width = static_cast<int32_t>(num("window_width", 0));
   p.window_height = static_cast<int32_t>(num("window_height", 0));
 
+  // The font allow-list. Presence of the key is what turns filtering on: an empty
+  // array would mean "no fonts installed", which is never what anyone wants, so
+  // an absent or empty list leaves DirectWrite untouched.
+  if (const mj::Value* fonts = root.find("fonts"); fonts != nullptr &&
+                                                   fonts->type == mj::Value::kArr &&
+                                                   fonts->arr && !fonts->arr->empty()) {
+    for (const mj::Value& item : *fonts->arr) {
+      const std::string name = item.as_str();
+      if (!name.empty()) p.fonts.families.push_back(name);
+    }
+    p.fonts.has_families = !p.fonts.families.empty();
+  }
+
   // A profile with no spoofable surface at all is treated as disabled so the
   // shim does not install pointless hooks.
   const bool has_any = p.cpu.hardware_concurrency != 0 || p.memory.total_bytes != 0 ||
                        p.screen.width != 0 || p.gpu.renderer.size() != 0 ||
-                       p.time.timezone_id.size() != 0;
+                       p.time.timezone_id.size() != 0 || p.fonts.has_families;
   p.enabled = has_any;
   return p;
 }

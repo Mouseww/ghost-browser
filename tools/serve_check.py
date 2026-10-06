@@ -106,6 +106,7 @@ PAGE = """<!doctype html>
   <p id="trusted" aria-label="trusted=0">trusted: 0</p>
   <p id="untrusted" aria-label="untrusted=0">untrusted: 0</p>
   <p id="cookie" aria-label="cookie=pending">cookie: pending</p>
+  <p id="fonts" aria-label="fonts=pending">fonts: pending</p>
   <div style="height:1500px"></div>
   <p id="bottom" aria-label="bottom=reached">the bottom of the page</p>
 
@@ -159,6 +160,31 @@ PAGE = """<!doctype html>
   const debug = gl && gl.getExtension("WEBGL_debug_renderer_info");
   publish("gpu", "gpu",
           debug ? gl.getParameter(debug.UNMASKED_RENDERER_WEBGL) : "no webgl");
+
+  // Font enumeration. A family that is not installed falls back to the generic
+  // and yields that generic's width, so measuring against both generics is how a
+  // page decides "installed or not" without calling DirectWrite itself. The list
+  // mixes fonts every Windows has with fonts that only appear when Office or a
+  // developer's toolchain is installed, which is the tell the profile removes.
+  const FONT_CANDIDATES = ["Arial", "Segoe UI", "Times New Roman", "MS Outlook",
+                           "Cascadia Code", "Noto Sans SC", "Ubuntu Mono",
+                           "Agency FB", "Bahnschrift"];
+  const fontCtx = document.createElement("canvas").getContext("2d");
+  const probeText = "mmmmmmmmmmlli";
+  const baseline = {};
+  for (const generic of ["monospace", "sans-serif"]) {
+    fontCtx.font = "72px " + generic;
+    baseline[generic] = fontCtx.measureText(probeText).width;
+  }
+  const installed = [];
+  for (const family of FONT_CANDIDATES) {
+    fontCtx.font = "72px '" + family + "', monospace";
+    const a = fontCtx.measureText(probeText).width;
+    fontCtx.font = "72px '" + family + "', sans-serif";
+    const b = fontCtx.measureText(probeText).width;
+    if (a !== baseline.monospace || b !== baseline["sans-serif"]) installed.push(family);
+  }
+  publish("fonts", "fonts", installed.join("+") || "none");
 </script>
 </body>
 </html>
@@ -303,6 +329,18 @@ def main() -> int:
                         profile["gpu_adapter_description"])
         checks.eq("no automation globals are visible to the page",
                   browser.label_value("automation"), "none")
+
+        # Font filtering: the families every Windows ships must survive, and the
+        # ones that betray Office or a developer's toolchain must not. This host
+        # has 266 families, so without the filter every one of these shows up.
+        fonts = (browser.label_value("fonts") or "").split("+")
+        kept = [f for f in ("Arial", "Segoe UI", "Times New Roman") if f in fonts]
+        leaked = [f for f in ("MS Outlook", "Cascadia Code", "Noto Sans SC",
+                              "Ubuntu Mono", "Agency FB") if f in fonts]
+        checks.eq("the stock fonts a clean Windows has are still installed",
+                  len(kept), 3, f"installed={fonts}")
+        checks.eq("the fonts that betray extra software are gone", leaked, [],
+                  f"still visible={leaked}")
 
         # Separates "the page could not set a cookie" from "the cookie was set
         # but never reached disk" -- two very different failures that look

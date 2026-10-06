@@ -518,3 +518,83 @@ WebGL 从「必须重编引擎」降级为「Track A 即可」，大幅缩小了
 
 行为引擎（§7）、验证码（§6）、Linux/macOS（§8）都还没有实现。
 
+## 13. 字体通道 — DirectWrite 是 Track A 唯一还剩的可达指纹面
+
+### 13.1 为什么是字体，而不是 canvas / audio
+
+canvas 的像素由渲染进程内的 Skia 光栅化，audio 的采样由 Blink 的 DSP 产生，**两者都不
+跨任何 OS API**。Track A 的全部手段是 hook 系统调用与 COM vtable，所以这两个面在结构上
+就够不到——不是工作量问题，是没有可拦截的调用。它们只能等 Track B（改 Chromium 源码）。
+
+字体枚举不一样。Skia 在 Windows 上的字体后端走 **DirectWrite**，而 DirectWrite 是一个
+真实的、可被 hook 的 OS 组件。而且本机字体列表本身就是**最响的指纹之一**：它直接读出
+机器上装了什么软件。本机实测 **266 个字体族**——Windows 自带 + 整套 Office + 中文 IME
+包 + 开发者的工具链（`Cascadia Code`、`Noto Sans SC`、`Ubuntu Mono`）。任意一个都能给
+档案定期，组合起来能直接指认到人。
+
+### 13.2 做法：照搬 DXGI 适配器的 vtable 先例
+
+不改源码、不需要符号，和 §11 的 DXGI 通道同一套路：
+
+1. `install_hook_export("dwrite.dll", "DWriteCreateFactory", ...)` 装导出钩子。
+2. 在 detour 里调真函数拿到 `IDWriteFactory*`，把 **vtable 槽 3**
+   （`GetSystemFontCollection`）改成我们的实现，原值存为 trampoline。
+   **`factory_patched` 守卫是必需的**：工厂会被创建多次，第二次若不守卫就会把已经改写的
+   槽当成真函数，无限递归。
+3. 拿到 `IDWriteFontCollection*` 后改它的 vtable：槽 3 `GetFontFamilyCount`、
+   槽 4 `GetFontFamily`、槽 5 `FindFamilyName`。（这些槽位自 Windows 7 起冻结。）
+4. 先遍历真集合，对每个 family 取 `GetFamilyNames()`（优先 `FindLocaleName(L"en-us")`，
+   否则 index 0），命中档案白名单的记下**真实下标**，得到 `visible_to_real` 映射。
+5. `GetFontFamilyCount` 返回映射长度；`GetFontFamily(i)` 转发到
+   `real_family(visible_to_real[i])`。映射是必需的——调用方会把 `FindFamilyName` 返回的
+   下标原样交回给 `GetFontFamily`，两者必须自洽。
+
+`VirtualProtect(vtable, sizeof(void*) * 8, PAGE_READWRITE, &old)` 改完再还原。
+
+### 13.3 不能按请求字符串匹配
+
+一个字体族有多个本地化名字。`MS Gothic` 同时也是 `ＭＳ ゴシック`，`SimSun` 同时也是
+`宋体`。如果 `FindFamilyName` 拿请求的字符串去和白名单比对，合法别名会被误拒——而按
+canonical 名比对又会漏掉别名进来的路径，两者矛盾。
+
+正确做法是**先让真集合解析**：调 `real_find_family(self, name, &real_index, exists)`，
+拿到真实下标后再判断它是否在 `visible_to_real` 里。命中就返回我们这边的下标，不命中就
+返回 `*exists = FALSE; *index = UINT32_MAX; return S_OK;`——即「这台机器上没装这个字体」，
+正是 `document.fonts.check()` 和 canvas `measureText` 期望看到的答案，两者因此不会互相
+矛盾。**整个过程不需要任何字符串匹配。**
+
+### 13.4 一个都不匹配时拒绝 patch
+
+如果档案列出的族在本机一个都不存在，`visible_to_real` 为空，我们就**放弃 patch** 而不是
+返回空集合。理由：一个相信自己没有任何字体的浏览器会把文字渲染得极其明显地崩坏，那是比
+「不过滤」更糟的破绽。宁可退回真实列表，也不要制造一个一眼假的渲染结果。
+
+同理，档案里没有 `fonts` 键就完全不装这个钩子，保持 pass-through。
+
+### 13.5 实测
+
+| 项 | 值 |
+|---|---|
+| 宿主字体族总数 | 266 |
+| 生成档案里的白名单 | 89（`ghost profile new` 自动填充的标准 Windows 集合） |
+| 钩子关闭时页面上可见 | `Cascadia Code`、`Noto Sans SC`、`Ubuntu Mono`、`Agency FB` 全部泄漏 |
+| 钩子开启时页面上可见 | 只剩 `Arial`、`Segoe UI`、`Times New Roman`、`Bahnschrift` |
+
+**A/B 对照**：`GHOST_HOOK_MASK=BF`（十六进制，除字体外全部启用）→
+`[FAIL] the fonts that betray extra software are gone
+actual=['Cascadia Code', 'Noto Sans SC', 'Ubuntu Mono', 'Agency FB']`，`19 checks, 1 failed`；
+mask 恢复默认后 `19 checks, 0 failed`。**证明移除它们的就是字体钩子本身。**
+
+> `GHOST_HOOK_MASK` 是十六进制。`wcstoul(..., 16)` 会把 `"0x3F"` 解析成 `0` 从而静默关掉
+> **全部**钩子，所以现在解析前先跳过可选的 `0x`/`0X` 前缀。
+
+### 13.6 局限
+
+- **只能隐藏，不能凭空发明。** 可见集合 = 档案白名单 ∩ 本机真实存在的字体。档案里列一个
+  本机没有的字体不会让它出现。
+- **字体度量仍是宿主的。** 枚举被过滤了，但 Skia 拿到字体后算出的宽度、字距、行高还是
+  真实值。本机装了 `Arial` 的话，`Arial` 的度量就是真的——这通常没问题，但如果档案声称的
+  字体被换成了 fallback，度量会露馅。
+- **仍是进程级的。** 钩子装在哪个进程就只影响哪个进程；渲染进程能否被注入仍然取决于
+  §10.2 的沙箱问题。
+

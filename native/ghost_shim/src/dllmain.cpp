@@ -24,6 +24,7 @@ void install_time_hooks();
 void install_gpu_hooks();
 void install_proc_hooks();
 void install_brand_hooks();
+void install_dwrite_hooks();
 }  // namespace ghost
 
 namespace {
@@ -44,12 +45,18 @@ DWORD WINAPI init_thread(LPVOID) {
 
   // GHOST_HOOK_MASK lets a hook group be switched off without a rebuild, so a group
   // that destabilises the host can be isolated in one run. Bit 0 sysinfo, 1 display,
-  // 2 time, 3 gpu, 4 process-creation, 5 branding. Absent or unparsable means
-  // "install everything".
+  // 2 time, 3 gpu, 4 process-creation, 5 branding, 6 fonts. Absent or unparsable
+  // means "install everything".
+  //
+  // The value is hexadecimal and an optional 0x prefix is accepted, because
+  // wcstoul with base 16 parses "0x3F" as 0 and would otherwise silently disable
+  // every hook.
   unsigned long mask = 0xFFFFFFFFul;
   wchar_t mask_text[32] = {0};
   if (GetEnvironmentVariableW(L"GHOST_HOOK_MASK", mask_text, 32) > 0) {
-    mask = std::wcstoul(mask_text, nullptr, 16);
+    const wchar_t* digits = mask_text;
+    if (digits[0] == L'0' && (digits[1] == L'x' || digits[1] == L'X')) digits += 2;
+    mask = std::wcstoul(digits, nullptr, 16);
     ghost::ghost_log("hook mask override: 0x%lX", mask);
   }
 
@@ -59,6 +66,7 @@ DWORD WINAPI init_thread(LPVOID) {
   if ((mask & 0x08ul) != 0) ghost::install_gpu_hooks();
   if ((mask & 0x10ul) != 0) ghost::install_proc_hooks();
   if ((mask & 0x20ul) != 0) ghost::install_brand_hooks();
+  if ((mask & 0x40ul) != 0) ghost::install_dwrite_hooks();
   ghost::hook_engine_enable_all();
 
   const ghost::HookStats& s = ghost::stats();

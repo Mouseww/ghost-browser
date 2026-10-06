@@ -38,8 +38,8 @@ file(TO_CMAKE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/assets/ghost.ico" GHOST_ICON_PAT
 
 # One version string for every artifact, so the shim and the launcher cannot
 # disagree about which build is running.
-set(GHOST_VERSION 0.3.0)
-set(GHOST_VERSION_COMMA 0,3,0,0)
+set(GHOST_VERSION 0.4.0)
+set(GHOST_VERSION_COMMA 0,4,0,0)
 
 # ---------------------------------------------------------------------------
 # ghost_shim — the injected native layer
@@ -55,6 +55,7 @@ add_library(ghost_shim SHARED
   ghost_shim/src/hooks_gpu.cpp
   ghost_shim/src/hooks_proc.cpp
   ghost_shim/src/hooks_brand.cpp
+  ghost_shim/src/hooks_dwrite.cpp
   "${CMAKE_CURRENT_BINARY_DIR}/shim.rc")
 target_include_directories(ghost_shim PRIVATE ghost_shim/include ghost_shim/src)
 target_link_libraries(ghost_shim PRIVATE minhook shcore user32 gdi32 advapi32)
