@@ -267,5 +267,6 @@ Three results that changed the architecture, all recorded in
 - `harness/run_detect.py` is flaky (roughly a 50% chance of `NO REPORT
   RECEIVED` from a Chrome startup race) and is deliberately not wired into CI.
 
+[0.3.0]: https://github.com/Mouseww/ghost-browser/releases/tag/v0.3.0
 [0.2.0]: https://github.com/Mouseww/ghost-browser/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Mouseww/ghost-browser/releases/tag/v0.1.0
