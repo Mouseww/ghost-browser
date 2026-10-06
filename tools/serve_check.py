@@ -15,6 +15,7 @@ there is no protocol to ask.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import importlib.util
 import json
 import os
@@ -34,6 +35,28 @@ if hasattr(sys.stdout, "reconfigure"):
 from ghost_client import Ghost, GhostError  # noqa: E402
 
 GHOST = ROOT / "native" / "build" / "bin" / "ghost.exe"
+
+# Windows throws synthesized input away while a session is disconnected: there is
+# no foreground window for SendInput to deliver to, and it fails silently rather
+# than reporting an error.
+NO_FOREGROUND = ("no foreground window: Windows discards synthesized input in a "
+                 "disconnected or headless session")
+
+# The checks that cannot run without synthesized input.
+INPUT_CHECKS = (
+    "clicking it produced a trusted event",
+    "typing reached the page as trusted input",
+    "a key combo selected the field before retyping",
+    "the page counted trusted events",
+    "not one event was untrusted",
+    "scrolling was accepted",
+)
+
+
+def foreground_window() -> int:
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.GetForegroundWindow.restype = ctypes.c_void_p
+    return user32.GetForegroundWindow() or 0
 
 
 def kill_stale_browser(data_dir: Path) -> int:
@@ -168,17 +191,32 @@ class Checks:
     def ok(self, name: str, condition: bool, detail: str = "") -> None:
         self.results.append(("PASS" if condition else "FAIL", name, detail))
 
+    def gap(self, name: str, reason: str) -> None:
+        """Record a check this environment cannot exercise at all.
+
+        Windows discards synthesized input while a session is disconnected, so
+        the input-driven checks simply cannot run there. Reporting that as GAP
+        rather than PASS keeps the suite honest about what it did not measure.
+        """
+        self.results.append(("GAP", name, reason))
+
     def contains(self, name: str, haystack: str, needle: str) -> None:
         verdict = "PASS" if needle in (haystack or "") else "FAIL"
         self.results.append((verdict, name, f"needle={needle!r} in {haystack!r}"))
 
     def report(self) -> int:
         failed = 0
+        gaps = 0
         for verdict, name, detail in self.results:
             if verdict == "FAIL":
                 failed += 1
+            elif verdict == "GAP":
+                gaps += 1
             print(f"[{verdict}] {name}" + (f"  {detail}" if detail else ""))
-        print(f"\n{len(self.results)} checks, {failed} failed")
+        tail = f"\n{len(self.results)} checks, {failed} failed"
+        if gaps:
+            tail += f", {gaps} not measurable in this session"
+        print(tail)
         return failed
 
 
@@ -190,6 +228,9 @@ def profile_json(profile_id: str) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--ghost", type=Path, default=GHOST,
+                    help="the ghost.exe to grade; point it at a release download "
+                         "to grade exactly what users get")
     ap.add_argument("--id", default="serve-check")
     ap.add_argument("--port", type=int, default=8741)
     ap.add_argument("--timeout", type=float, default=90.0)
@@ -228,9 +269,14 @@ def main() -> int:
         print(f"stopped {stale} browser process(es) still holding {data_dir.name}")
         time.sleep(2.0)
 
-    browser = Ghost(args.id, ghost=GHOST)
+    browser = Ghost(args.id, ghost=args.ghost)
+    input_available = foreground_window() != 0
+    if not input_available:
+        print(f"note: {NO_FOREGROUND}")
+        print("      input-driven checks will be reported as GAP, not PASS")
     try:
-        browser.start(wait=args.timeout, log=log)
+        # With no way to type a URL, load it on the command line instead.
+        browser.start(url=None if input_available else url, wait=args.timeout, log=log)
         status = browser.status()
         window = status.get("window") or {}
         print(f"browser pid {status['pid']}, pipe {status['pipe']}, "
@@ -239,9 +285,12 @@ def main() -> int:
         checks.ok("the browser has a window to drive", bool(window),
                   f"window={window or None}")
 
-        navigated = browser.navigate(url)
-        checks.ok("navigate reports a changed window title", bool(navigated.get("navigated")),
-                  f"title={navigated.get('title')!r}")
+        if input_available:
+            navigated = browser.navigate(url)
+            checks.ok("navigate reports a changed window title",
+                      bool(navigated.get("navigated")), f"title={navigated.get('title')!r}")
+        else:
+            checks.gap("navigate reports a changed window title", NO_FOREGROUND)
 
         browser.wait_for(contains="ghost control plane check", timeout=args.timeout)
         checks.ok("the page is readable through the accessibility tree", True)
@@ -265,27 +314,32 @@ def main() -> int:
         submit = browser.first(role="button", name="Submit")
         checks.ok("the Submit button is addressable by role and name", submit is not None,
                   f"bounds={submit['bounds'] if submit else None}")
-        browser.click(role="button", name="Submit")
-        checks.eq("clicking it produced a trusted event",
-                  browser.label_value("result"), "clicked via trusted event")
 
-        browser.type("hello ghost", into={"role": "edit", "name": "Message box"})
-        checks.eq("typing reached the page as trusted input",
-                  browser.label_value("echo"), "hello ghost")
+        if input_available:
+            browser.click(role="button", name="Submit")
+            checks.eq("clicking it produced a trusted event",
+                      browser.label_value("result"), "clicked via trusted event")
 
-        browser.key("ctrl", "a")
-        browser.type("replaced")
-        checks.eq("a key combo selected the field before retyping",
-                  browser.label_value("echo"), "replaced")
+            browser.type("hello ghost", into={"role": "edit", "name": "Message box"})
+            checks.eq("typing reached the page as trusted input",
+                      browser.label_value("echo"), "hello ghost")
 
-        trusted = int(browser.label_value("trusted") or 0)
-        checks.ok("the page counted trusted events", trusted > 0, f"trusted={trusted}")
-        checks.eq("not one event was untrusted", browser.label_value("untrusted"), "0")
+            browser.key("ctrl", "a")
+            browser.type("replaced")
+            checks.eq("a key combo selected the field before retyping",
+                      browser.label_value("echo"), "replaced")
 
-        # --- scrolling and screenshots -------------------------------------
-        browser.scroll(600)
-        checks.ok("scrolling was accepted", True)
+            trusted = int(browser.label_value("trusted") or 0)
+            checks.ok("the page counted trusted events", trusted > 0, f"trusted={trusted}")
+            checks.eq("not one event was untrusted", browser.label_value("untrusted"), "0")
 
+            browser.scroll(600)
+            checks.ok("scrolling was accepted", True)
+        else:
+            for name in INPUT_CHECKS:
+                checks.gap(name, NO_FOREGROUND)
+
+        # --- capture ---------------------------------------------------------
         shot = browser.screenshot()
         size = Path(shot).stat().st_size if Path(shot).exists() else 0
         checks.ok("the window was captured without the browser's help", size > 5000,

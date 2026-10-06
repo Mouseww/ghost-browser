@@ -154,6 +154,21 @@ BOOL CALLBACK sweep_window(HWND window, LPARAM param) {
 
   state->window = window;
 
+  // A desktop can have no foreground window at all: a disconnected RDP session,
+  // a freshly created desktop, or a machine nobody has touched since boot.
+  // Synthesized input is delivered to the foreground thread, so with none,
+  // nothing the control plane sends ever lands -- Ctrl+L silently does nothing
+  // and the caller sees a timeout far away from the cause. Windows lets a
+  // process claim the foreground for its own window when nobody holds it, but
+  // the controller process is not allowed to, which is why this has to happen
+  // from inside the browser.
+  if (GetForegroundWindow() == nullptr) {
+    SetForegroundWindow(window);
+    if (GetForegroundWindow() == window) {
+      ghost_log("brand: claimed the empty foreground for hwnd=%p", window);
+    }
+  }
+
   const std::wstring current(title);
   const std::wstring rewritten = rewrite_title(current);
   if (rewritten != current) {

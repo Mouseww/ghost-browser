@@ -5,6 +5,32 @@ All notable changes to this project are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Window activation was flaky.** Windows refuses `SetForegroundWindow` to a
+  process the user is not interacting with, and a single `AttachThreadInput`
+  plus an ALT press was not always enough — a release acceptance run died with
+  "the window could not be brought to the foreground". Activation now also
+  attaches to the thread that currently owns the foreground, retries the whole
+  sequence, uses the topmost raise/lower toggle that the foreground lock does
+  not block, and falls back to `SwitchToThisWindow`.
+- **A disconnected session failed silently.** Windows discards synthesized input
+  while a session is disconnected — there is no foreground window for `SendInput`
+  to deliver to, and the call reports success anyway. Every command after the
+  first therefore timed out with no explanation. The control plane now detects
+  the condition and says so: "this session has no foreground window, so Windows
+  discards synthesized input (a disconnected or headless session); connect the
+  session and retry". This was found the hard way: the same suite that passed
+  17/17 failed completely after the RDP session dropped, with no code change
+  between the two runs.
+- **`serve_check.py` reported environment blocks as failures.** A check that
+  cannot run because the session cannot deliver input is now reported as `GAP`
+  with the reason, and the summary counts it separately
+  (`17 checks, 0 failed, 7 not measurable in this session`) instead of claiming
+  a pass it did not earn.
+
 ## [0.3.0] - 2026-10-06
 
 The browser can be driven now, and it wears the project's name. `ghost serve`

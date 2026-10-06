@@ -164,6 +164,26 @@ locks its `--user-data-dir` exclusively, so a browser left behind makes the next
 run's browser exit instantly and show no window at all. A session started with
 `--attach <pid>` owns nothing and leaves the browser running.
 
+### Input needs a connected session
+
+`click`, `type`, `key` and `scroll` are real `SendInput` events, and Windows
+**discards synthesized input while the session is disconnected** — there is no
+foreground window to deliver it to, and the call reports success anyway. A
+disconnected or headless RDP session therefore cannot be driven, and because the
+failure is silent, every command after the first would simply time out. The
+control plane now names the condition instead:
+
+```
+control plane error: this session has no foreground window, so Windows discards
+synthesized input (a disconnected or headless session); connect the session and retry
+```
+
+This is an environment requirement, not a limitation of the approach: the same
+suite passes in full once the session is connected. Everything that does not need
+input still works in a disconnected session — `status`, `tree`, `find`,
+`screenshot`, and reading cookies after shutdown — and passing a URL on the
+command line (`ghost serve <url>`) loads a page without typing.
+
 ### The Python client
 
 ```python
@@ -294,7 +314,7 @@ pairs above consistent.
 
 ## 6. Verify it in a real browser
 
-The repository has two graders. Both measure from **inside the renderer** and
+There are three graders. All of them measure from **inside the renderer** and
 POST the result to a local collector — the only honest way to measure when there
 is no debugging protocol to query.
 
@@ -307,14 +327,25 @@ python tools\product_check.py
 
 # grades the shim through the developer launcher, with the sandbox on
 python harness\run_detect.py --sandboxed --chrome-arg=--disable-gpu-sandbox
+
+# grades the control plane: click, type, scroll, screenshot, cookies
+python tools\serve_check.py
+
+# ...or grade the artifact users actually download
+python tools\serve_check.py --ghost "$env:TEMP\ghost.exe"
 ```
 
-Both print a per-check table and end with `34 checks, 0 failed`. The harness run
-shows `[GAP]` (not `[PASS]`) on `hardwareConcurrency` and `deviceMemory`, because
-the sandbox makes those structurally unreachable — a gap, not a failure.
+The first two print a per-check table and end with `34 checks, 0 failed`; the
+control plane check ends with `17 checks, 0 failed`. The harness run shows
+`[GAP]` (not `[PASS]`) on `hardwareConcurrency` and `deviceMemory`, because the
+sandbox makes those structurally unreachable — a gap, not a failure.
 
 `run_detect.py` is roughly 50% flaky (`NO REPORT RECEIVED` from a Chrome startup
 race). Run it again.
+
+`serve_check.py` drives a real window, so it needs the foreground: it clicks and
+types with `SendInput`, which goes to whatever is in front. Do not touch the
+mouse or keyboard while it runs.
 
 ## 7. Building from source
 

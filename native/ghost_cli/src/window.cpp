@@ -90,39 +90,93 @@ bool activate_window(HWND handle, std::string* error) {
   }
   if (GetForegroundWindow() == handle) return true;
 
+  // Windows discards synthesized input while the session is disconnected: there
+  // is no foreground window for SendInput to deliver to, and it is a silent
+  // no-op rather than an error. Every later command would then time out with no
+  // hint of the cause, so say what is actually wrong instead.
+  if (GetForegroundWindow() == nullptr) {
+    if (error != nullptr) {
+      *error =
+          "this session has no foreground window, so Windows discards synthesized "
+          "input (a disconnected or headless session); connect the session and retry";
+    }
+    return false;
+  }
+
   const DWORD target_thread = GetWindowThreadProcessId(handle, nullptr);
   const DWORD our_thread = GetCurrentThreadId();
+  const HWND foreground = GetForegroundWindow();
+  const DWORD foreground_thread =
+      foreground ? GetWindowThreadProcessId(foreground, nullptr) : 0;
 
-  // Windows refuses SetForegroundWindow from a process the user is not
-  // interacting with. Two documented conditions have to be satisfied at once:
+  // Windows refuses SetForegroundWindow to a process the user is not
+  // interacting with, so several documented conditions have to hold at once:
   // sharing the target's input queue, and being the thread that last saw input.
-  // A synthetic ALT press satisfies the second, which is why it is here.
-  const bool attached =
-      (target_thread != 0 && target_thread != our_thread) &&
-      AttachThreadInput(our_thread, target_thread, TRUE) != FALSE;
+  // Attaching to *both* the target and whatever is currently in front is what
+  // makes the attach effective when another window owns the foreground; a
+  // synthetic ALT press satisfies the last-input condition.
+  const auto attach = [&](DWORD thread, BOOL on) {
+    if (thread != 0 && thread != our_thread) AttachThreadInput(our_thread, thread, on);
+  };
+  attach(target_thread, TRUE);
+  attach(foreground_thread, TRUE);
 
-  INPUT alt[2] = {};
-  alt[0].type = INPUT_KEYBOARD;
-  alt[0].ki.wVk = VK_MENU;
-  alt[1].type = INPUT_KEYBOARD;
-  alt[1].ki.wVk = VK_MENU;
-  alt[1].ki.dwFlags = KEYEVENTF_KEYUP;
-  SendInput(2, alt, sizeof(INPUT));
+  // The topmost toggle is the reliable part: raising and immediately lowering a
+  // window brings it to the foreground in cases where SetForegroundWindow alone
+  // is silently ignored. Retrying the whole sequence matters because the
+  // foreground lock can be held by a window that is itself still settling.
+  bool activated = false;
+  for (int round = 0; round < 4 && !activated; round++) {
+    INPUT alt[2] = {};
+    alt[0].type = INPUT_KEYBOARD;
+    alt[0].ki.wVk = VK_MENU;
+    alt[1].type = INPUT_KEYBOARD;
+    alt[1].ki.wVk = VK_MENU;
+    alt[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(2, alt, sizeof(INPUT));
 
-  ShowWindow(handle, SW_SHOW);
-  BringWindowToTop(handle);
-  SetWindowPos(handle, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
-  SetForegroundWindow(handle);
-  SetActiveWindow(handle);
-  SetFocus(handle);
-  if (attached) AttachThreadInput(our_thread, target_thread, FALSE);
+    ShowWindow(handle, SW_SHOW);
+    BringWindowToTop(handle);
+    SetWindowPos(handle, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    SetWindowPos(handle, HWND_NOTOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    SetForegroundWindow(handle);
+    SetActiveWindow(handle);
+    SetFocus(handle);
 
-  for (int attempt = 0; attempt < 60; attempt++) {
-    if (GetForegroundWindow() == handle) return true;
-    Sleep(25);
+    for (int attempt = 0; attempt < 20 && !activated; attempt++) {
+      if (GetForegroundWindow() == handle) activated = true;
+      else Sleep(25);
+    }
   }
-  *error = "the window could not be brought to the foreground";
-  return false;
+
+  // SwitchToThisWindow is undocumented but has been stable for decades and
+  // ignores the foreground lock entirely. It is a last resort because it can
+  // steal focus from whatever the user is doing.
+  if (!activated) {
+    using SwitchToThisWindowFn = void(__stdcall*)(HWND, BOOL);
+    if (HMODULE user32 = GetModuleHandleW(L"user32.dll")) {
+      auto switch_to = reinterpret_cast<SwitchToThisWindowFn>(
+          reinterpret_cast<void*>(GetProcAddress(user32, "SwitchToThisWindow")));
+      if (switch_to != nullptr) {
+        switch_to(handle, TRUE);
+        for (int attempt = 0; attempt < 20 && !activated; attempt++) {
+          if (GetForegroundWindow() == handle) activated = true;
+          else Sleep(25);
+        }
+      }
+    }
+  }
+
+  attach(foreground_thread, FALSE);
+  attach(target_thread, FALSE);
+
+  if (!activated) {
+    *error = "the window could not be brought to the foreground";
+    return false;
+  }
+  return true;
 }
 
 double window_scale(HWND handle) {
