@@ -10,6 +10,8 @@
 //   3. ResumeThread. Only now does the browser start.
 #pragma once
 
+#include <windows.h>
+
 #include <string>
 #include <vector>
 
@@ -20,6 +22,7 @@ struct LaunchOptions {
   std::string profile_json;  // empty means the shim runs as a pass-through
   std::string timezone;      // IANA name; also exported as TZ for ICU
   std::string language;      // BCP-47 tag; appended as --lang when absent
+  std::string brand_name = "Ghost Browser";  // what the browser calls itself
   std::string exe;
   std::vector<std::string> args;
   // When set, the target's stdout and stderr are redirected into this file. The
@@ -27,6 +30,9 @@ struct LaunchOptions {
   // inherited, and inherited handles in a restricted child are exactly what the
   // sandbox exists to prevent.
   std::string capture_to;
+  // When set, receives the target's process id as soon as it exists. The control
+  // plane needs it to find the browser window it is supposed to drive.
+  DWORD* pid_out = nullptr;
   bool wait = true;
   bool verbose = false;
   bool allow_unspoofed = false;

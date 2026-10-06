@@ -447,3 +447,74 @@ DXGI 通道覆盖了 `UNMASKED_VENDOR_WEBGL` / `UNMASKED_RENDERER_WEBGL`，但**
 这些仍在 `chrome.dll` 内部，只能靠 Track B 源码 patch。**DXGI 通道的价值在于：它把
 WebGL 从「必须重编引擎」降级为「Track A 即可」，大幅缩小了 Track B 的必要范围。**
 
+## 12. L3 控制面已落地 — 命名管道 + UIA + SendInput
+
+§4 设计的东西已经实现，作为 `ghost.exe` 的 `serve` 模式（不是独立的 Rust daemon）。
+验收：`python tools/serve_check.py` → **17 checks, 0 failed**。
+
+### 12.1 为什么不写独立 daemon
+
+产品的核心承诺是「一个自包含文件」。引入 Rust 工具链会同时破坏这个承诺、让 CI 多一套
+工具链，而控制面本身几乎全是 Win32 C API（UIA 的 COM 接口、`SendInput`、`PrintWindow`）。
+唯一需要 SQLite 的部分（cookie）放到了 Python 客户端，用标准库 `sqlite3`。
+
+### 12.2 传输：命名管道，不是端口
+
+`\\.\pipe\ghost-<profile-id>`，换行分隔 JSON，一请求一响应。**页面能扫端口，扫不到管道。**
+服务端一次只服务一个连接：`DisconnectNamedPipe` 与下一次 `ConnectNamedPipe` 之间管道名会
+短暂消失，正在处理中的请求返回 `ERROR_PIPE_BUSY`。两者都是正常状态，客户端必须重试
+（`ghost_client.CONNECT_RETRY_SECONDS = 5.0`）——**连接重试窗口必须远短于请求超时**，
+否则对已死服务的一次请求要挂满整个超时。
+
+### 12.3 三个能力与实测
+
+| 能力 | 实现 | 实测 |
+|---|---|---|
+| 输入 | `SendInput`，鼠标路径插值（smoothstep + 垂直弓形，非瞬移）、按下 35–90 ms、`KEYEVENTF_UNICODE` 逐 UTF-16 码元打字 | `trusted=117`、`untrusted=0`，页面确认 `clicked via trusted event` |
+| 读取页面 | UIA `ControlViewWalker` 遍历，role/name/value/bounds | 按钮可按 role+name 定位，`bounds={'x': 11, 'y': 386, 'width': 71, 'height': 27}` |
+| 截屏 | `PrintWindow(hwnd, mem, PW_RENDERFULLCONTENT)`，失败退回 `BitBlt` | 7,963,590 字节 BMP |
+| 导航 | `Ctrl+L` → 打字 → `Enter`，轮询标题变化 | 标题变为 `ghost control plane check - Ghost Browser` |
+
+### 12.4 两个必须记住的 Win32 语义
+
+- **前台锁**：只 `AttachThreadInput` 不足以让窗口到前台。必须**先合成一次 ALT 按键**
+  （`SendInput` 发 `VK_MENU` down/up）使自己成为「最后输入线程」，再
+  `ShowWindow` + `BringWindowToTop` + `SetWindowPos(HWND_TOP, SWP_SHOWWINDOW)` +
+  `SetForegroundWindow`，最后轮询 `GetForegroundWindow()` 确认。
+- **UIA 的矩形是四元组 `[left, top, width, height]`**，不是 `[left, top, right, bottom]`。
+  按后者解析会得到大量负 width。
+
+### 12.5 品牌化与 infobar
+
+`--disable-gpu-sandbox` 会让 Chromium 弹一条 "unsupported command-line flag" 的 infobar：
+它既是肉眼可见的自动化痕迹，又偷走 56 px 视口高度。实测 **`--test-type` 让 infobar 节点数
+从 3 变 0**，所以 `browse`/`serve` 在非 `--sandbox` 档默认加上它。
+
+窗口品牌化由已经注入的 shim 完成（`native/ghost_shim/src/hooks_brand.cpp`）：hook
+`SetWindowTextW`/`SetWindowTextA` 替换引擎产品名、`SetCurrentProcessExplicitAppUserModelID`
+归组任务栏、`WM_SETICON` + `SetClassLongPtrW(GCLP_HICON/GCLP_HICONSM)` 贴图标。
+**局限**：`chrome://version`、磁盘上的 `chrome.exe`、窗口类名 `Chrome_WidgetWin_1`
+仍然是 Chrome——它们编译在二进制里。
+
+### 12.6 cookie 的三重障碍（实测）
+
+1. **运行时不可读。** Chrome 对 `Default/Network/Cookies` 不开放任何共享：
+   `CreateFileW` 在 share = 0/1/3/7 下全部 `ERROR_SHARING_VIOLATION`(32)，而同目录其他文件
+   正常打开 ⇒ 不是 ACL、不是沙箱。只能在浏览器退出后读。
+2. **会话 cookie 不入库。** 没有 `max-age`/`expires` 的 cookie 只存在于内存。
+3. **`value` 列永远是空串。** 真实值在 `encrypted_value`：`b"v10"` + AES-256-GCM
+   (`nonce(12)` + ciphertext + `tag(16)`)。密钥在 `<data_dir>/Local State` 的
+   `os_crypt.encrypted_key`（base64 的 `b"DPAPI"` + DPAPI 包裹的 32 字节密钥；无
+   `app_bound_encrypted_key`，即不是 App-Bound Encryption）。**明文 = 32 字节域绑定 + 值本身**，
+   所以 `ghost_check=ok` 解出来是 32 个未知字节后跟 `ok`。
+
+`ghost_client` 用 `ctypes` 调 `crypt32`/`bcrypt` 完成解密，**不引入第三方依赖**。用
+`bcrypt` 走 GCM 有三个坑，每个都表现为 `STATUS_ACCESS_VIOLATION` 而不是干净的错误返回：
+不声明 `argtypes`；`BCryptDecrypt` 有 **10** 个参数（漏掉末尾 `dwFlags`）；GCM 下
+**`pPaddingInfo` 也必须指向同一个 `BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO`**，
+传 `NULL` 会直接崩。
+
+### 12.7 仍未做
+
+行为引擎（§7）、验证码（§6）、Linux/macOS（§8）都还没有实现。
+

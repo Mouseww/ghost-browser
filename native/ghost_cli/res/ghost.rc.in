@@ -13,6 +13,10 @@
 
 #include <windows.h>
 
+// The executable's own icon. Resource id 1 is the lowest icon id, and that is
+// the one Explorer, the taskbar and the file dialog pick.
+1 ICON "@GHOST_ICON_PATH@"
+
 // 101 = ghost_shim.dll. Keep in sync with embed.h.
 101 RCDATA "@GHOST_SHIM_DLL_PATH@"
 
@@ -30,12 +34,12 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "CompanyName", "unknowbrowser contributors\0"
-            VALUE "FileDescription", "Ghost browser launcher\0"
+            VALUE "FileDescription", "Ghost Browser\0"
             VALUE "FileVersion", "@GHOST_VERSION@\0"
             VALUE "InternalName", "ghost\0"
             VALUE "LegalCopyright", "BSD-3-Clause\0"
             VALUE "OriginalFilename", "ghost.exe\0"
-            VALUE "ProductName", "ghost-browser\0"
+            VALUE "ProductName", "Ghost Browser\0"
             VALUE "ProductVersion", "@GHOST_VERSION@\0"
         END
     END

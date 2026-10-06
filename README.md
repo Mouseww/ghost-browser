@@ -22,11 +22,14 @@ are only needed for the fingerprint test page under `harness/`.
 | Area | State |
 |---|---|
 | Profile → engine flag/API spoofing | **working** |
-| Native shim (24 hooks, Win32/x64) | **working** |
+| Native shim (26 hooks, Win32/x64) | **working** |
 | Injection into the browser process | **working** |
 | Injection into the GPU process | **working** (needs `--disable-gpu-sandbox`) |
 | Injection into sandboxed renderers | **blocked by the restricted token** |
 | WebGL vendor / renderer (`UNMASKED_*`) | **working** — via DXGI adapter identity |
+| Zero-CDP control plane (`ghost serve`) | **working** — 15 checks |
+| Window branding (title, icon, taskbar) | **working** |
+| Reading cookies while the browser runs | **impossible** — Chrome holds the file unshared |
 | Fingerprint coherence harness | **34 checks, 0 failed** |
 | Canvas / Audio / font *metrics* | **not spoofed** (Track A gap) |
 | Captcha pipeline (CF, hCaptcha) | **not implemented** |
@@ -106,6 +109,54 @@ native\build\bin\ghost_launch.exe `
 Use `--no-sandbox` instead of `--disable-gpu-sandbox` if you also need the renderer-side
 values (`hardwareConcurrency`, `deviceMemory`); that gives up the renderer sandbox entirely.
 `ghost.exe browse` makes that trade-off for you and documents it in `ghost help`.
+
+### Driving the browser without CDP
+
+`ghost serve` puts the browser behind a JSON control plane carried over a **named pipe** —
+never a TCP port, because a page can scan ports and cannot scan pipes:
+
+```powershell
+.\ghost.exe serve --id demo --pipe demo --tz Europe/London --locale en-GB https://example.com
+```
+
+```python
+from tools.ghost_client import Ghost
+
+with Ghost("demo").start(url="https://example.com") as browser:
+    browser.wait_for(role="button", name="Accept")
+    browser.click(role="button", name="Accept")   # synthesized, so isTrusted is true
+    print(browser.tree(max_nodes=40))             # read through the accessibility tree
+    browser.screenshot("shot.bmp")                # PrintWindow, not a debugging protocol
+```
+
+There is no `Runtime.enable`, no injected utility script, and no port for a page to find. Input
+is `SendInput` — interpolated mouse paths rather than teleports, 35–90 ms press durations, and
+`KEYEVENTF_UNICODE` typing that ignores the keyboard layout. The page is read through UI
+Automation, and screenshots come from `PrintWindow`. `python tools/serve_check.py` grades all of
+it against a local page that reports its own state through `aria-label` — **17 checks, 0 failed**,
+including that every event the page received was `isTrusted`.
+
+Cookies are the one thing that cannot be read live: Chrome holds `Default/Network/Cookies` with
+**no sharing at all** (`ERROR_SHARING_VIOLATION` under every share mode), so
+`ghost_client.cookies()` harvests them after the browser exits. Reading them then takes two more
+steps — session cookies never reach the database, and the `value` column is always empty because
+Chrome 154 stores `b"v10"` + AES-256-GCM in `encrypted_value`, with the key DPAPI-wrapped in
+`Local State`. The client undoes all of it with `crypt32` and `bcrypt` through `ctypes`, so there
+is still no third-party dependency.
+
+### The window says "Ghost Browser"
+
+The shim already lives inside the browser process, so it rebrands the window from within: it
+hooks `SetWindowTextW`/`SetWindowTextA` to replace the engine's product name, sets the process
+AppUserModelID to `unknowbrowser.Ghost Browser` for taskbar grouping, and applies the project
+icon with `WM_SETICON` plus `SetClassLongPtrW(GCLP_HICON)` so later windows inherit it.
+
+`--test-type` is passed by default: Chromium's "unsupported command-line flag" infobar is both a
+visible automation tell and 56 px of stolen viewport.
+
+Three things still say Chrome, and cannot be changed at runtime because they are compiled into
+the engine: `chrome://version`, the on-disk file name `chrome.exe`, and the window class
+`Chrome_WidgetWin_1`.
 
 The launcher starts the target `CREATE_SUSPENDED`, injects the shim, waits for a real
 in-process readiness handshake, and only then resumes it. **If injection fails it aborts

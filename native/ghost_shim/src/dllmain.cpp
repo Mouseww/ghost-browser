@@ -23,6 +23,7 @@ void install_display_hooks();
 void install_time_hooks();
 void install_gpu_hooks();
 void install_proc_hooks();
+void install_brand_hooks();
 }  // namespace ghost
 
 namespace {
@@ -43,7 +44,8 @@ DWORD WINAPI init_thread(LPVOID) {
 
   // GHOST_HOOK_MASK lets a hook group be switched off without a rebuild, so a group
   // that destabilises the host can be isolated in one run. Bit 0 sysinfo, 1 display,
-  // 2 time, 3 gpu, 4 process-creation. Absent or unparsable means "install everything".
+  // 2 time, 3 gpu, 4 process-creation, 5 branding. Absent or unparsable means
+  // "install everything".
   unsigned long mask = 0xFFFFFFFFul;
   wchar_t mask_text[32] = {0};
   if (GetEnvironmentVariableW(L"GHOST_HOOK_MASK", mask_text, 32) > 0) {
@@ -56,6 +58,7 @@ DWORD WINAPI init_thread(LPVOID) {
   if ((mask & 0x04ul) != 0) ghost::install_time_hooks();
   if ((mask & 0x08ul) != 0) ghost::install_gpu_hooks();
   if ((mask & 0x10ul) != 0) ghost::install_proc_hooks();
+  if ((mask & 0x20ul) != 0) ghost::install_brand_hooks();
   ghost::hook_engine_enable_all();
 
   const ghost::HookStats& s = ghost::stats();

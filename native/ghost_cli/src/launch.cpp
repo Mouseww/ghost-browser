@@ -33,6 +33,11 @@ int launch_under_shim(const LaunchOptions& options) {
   if (!options.timezone.empty()) {
     SetEnvironmentVariableA("TZ", options.timezone.c_str());
   }
+  // Read by the shim's branding hooks. The engine's compiled-in product name
+  // cannot be changed, but the window title, icon and taskbar identity can.
+  if (!options.brand_name.empty()) {
+    SetEnvironmentVariableA("GHOST_BRAND_NAME", options.brand_name.c_str());
+  }
 
   std::string command_line = quote(options.exe);
   for (const std::string& a : options.args) command_line += " " + quote(a);
@@ -100,6 +105,7 @@ int launch_under_shim(const LaunchOptions& options) {
   }
 
   if (options.verbose) std::printf("suspended pid: %lu\n", process.dwProcessId);
+  if (options.pid_out != nullptr) *options.pid_out = process.dwProcessId;
 
   const auto release_capture = [&]() {
     if (capture != INVALID_HANDLE_VALUE) {

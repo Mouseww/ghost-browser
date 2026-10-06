@@ -5,6 +5,111 @@ All notable changes to this project are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-10-06
+
+The browser can be driven now, and it wears the project's name. `ghost serve`
+replaces the debugging protocol entirely, and the shim rebrands the window it
+lives in.
+
+### Added
+
+- **`ghost serve` — a zero-CDP control plane.** Newline-delimited JSON over a
+  **named pipe** (`\\.\pipe\ghost-<id>`), never a TCP port, because a page can
+  scan ports and cannot scan pipes. Commands: `status`, `windows`, `focus`,
+  `navigate`, `tree`, `find`, `click`, `type`, `key`, `scroll`, `screenshot`,
+  `call`, `shutdown`.
+  - **Input is synthesized with `SendInput`.** Mouse movement is interpolated
+    (smoothstep easing with a slight vertical bow, never a teleport), clicks hold
+    for 35–90 ms, and typing sends `KEYEVENTF_UNICODE` per UTF-16 code unit so it
+    bypasses the keyboard layout completely. Every event the page sees is
+    `isTrusted`, with a real hardware timestamp.
+  - **Reading the page uses the UI Automation tree**, not an injected binding, so
+    there is no `Runtime.enable`, no utility script, and nothing for the page to
+    observe. `navigate` types into the address bar with `Ctrl+L` rather than
+    touching the engine.
+  - **Screenshots come from `PrintWindow` with `PW_RENDERFULLCONTENT`**, falling
+    back to `BitBlt`.
+- **`tools/ghost_client.py`** — the Python client. The control plane is a pipe,
+  so the transport is `open(pipe, "r+b")`, a JSON line each way.
+- **`tools/serve_check.py`** — end-to-end acceptance for the control plane: a
+  local page reports its own state through `aria-label`, which the accessibility
+  tree exposes, so the assertions measure what the page actually saw.
+- **Browser branding.** The shim is already inside the browser process, so it
+  hooks `SetWindowTextW`/`SetWindowTextA` to replace the engine's product name,
+  sets the process AppUserModelID to `unknowbrowser.Ghost Browser`, and applies
+  the project icon via `WM_SETICON` plus `SetClassLongPtrW(GCLP_HICON)` (so later
+  windows inherit it). Title bars and the taskbar read `Ghost Browser`.
+- **`--test-type` by default.** Chromium's "unsupported command-line flag"
+  infobar is both a visible automation tell and 56 px of lost viewport height. It
+  is suppressed unless `--sandbox` is requested.
+- **`tools/make_icon.py`** and `native/assets/ghost.ico` — the icon is generated
+  from geometry at 8x supersampling, and embedded in both `ghost.exe` and
+  `ghost_shim.dll` so either can show it.
+
+### Fixed
+
+- **UI Automation bounding rectangles were decoded wrongly.** The
+  `UIA_BoundingRectanglePropertyId` quadruple is `[left, top, width, height]`,
+  not `[left, top, right, bottom]`; every element had a negative width.
+- **`activate_window` could not take the foreground.** `AttachThreadInput` alone
+  loses to the Windows foreground lock; a synthetic ALT press makes the calling
+  thread the last-input thread, after which `SetForegroundWindow` succeeds.
+- **The client raced the server's pipe.** Between `DisconnectNamedPipe` and the
+  next `ConnectNamedPipe` the name briefly does not resolve, and a concurrent
+  request returns `ERROR_PIPE_BUSY`. Both are normal states; the client retries
+  instead of failing.
+- **The brand sweep leaked icon handles.** `LoadImageW` without `LR_SHARED`
+  creates a new `HICON` on every pass; the handles are now loaded once and shared,
+  and the sweep is bounded by wall clock rather than by iteration count.
+- **`shutdown` left the browser running.** Chromium locks its `--user-data-dir`
+  exclusively, so a browser left behind made the *next* run's browser exit
+  immediately and present no window — which surfaced as "the browser has no
+  visible window yet", several layers from the cause. `shutdown` now closes the
+  browser it started (`WM_CLOSE`, then termination if it will not go). An
+  `--attach` session owns nothing and is left alone.
+- **A dead control plane took five minutes to report.** The client's connection
+  retry shared the request timeout, so a request against a stopped server hung
+  for the full 300 s. Connecting is now retried for 5 s; a successful connect
+  still leaves `readline` blocking for as long as a slow command needs.
+- **`cookie_db()` needed the control plane.** It asked the server for the profile
+  path, which fails by definition once the browser has been stopped for the
+  cookie read. The path can now be passed in, and `serve_check` resolves it
+  before stopping.
+- **Cookies could not be read at all.** Three separate causes, all now handled:
+  the database is locked exclusively while the browser runs; session cookies are
+  never persisted; and Chrome 154 leaves the `value` column empty, storing
+  `b"v10"` + AES-256-GCM instead. The client decrypts via `crypt32`/`bcrypt` with
+  no third-party dependency. See Findings.
+
+### Findings
+
+- **Chrome holds `Default/Network/Cookies` with no sharing at all.**
+  `CreateFileW` fails with `ERROR_SHARING_VIOLATION` (32) under every share mode,
+  while other files in the same directory tree open normally, so this is neither
+  an ACL nor a sandbox effect. Reading cookies while the browser runs is
+  impossible by design; harvesting has to happen after shutdown, which is what
+  `ghost_client.cookies()` does.
+- **Chrome 154 does not store cookie values in the `value` column.** It is always
+  empty; the real bytes live in `encrypted_value` as `b"v10"` followed by
+  AES-256-GCM over `nonce(12) || ciphertext || tag(16)`. The key is in
+  `<data_dir>/Local State` at `os_crypt.encrypted_key` — base64 of `b"DPAPI"`
+  plus a DPAPI-wrapped 32-byte AES key, with no `app_bound_encrypted_key`, so
+  this is the pre-App-Bound scheme. The decrypted plaintext is **32 bytes of
+  domain binding followed by the value**: every `.google.com` row shares one
+  32-byte prefix, and `ghost_check=ok` decrypts to 32 opaque bytes then `ok`.
+  A cookie with no `max-age` or `expires` never reaches the database at all.
+- **`navigator.deviceMemory` is not clamped to 8 GiB on Chrome 154.** A profile
+  claiming 32 GiB reports 32, so the assertion, not the spoof, was wrong.
+
+### Known gaps
+
+- `chrome://version`, the on-disk `chrome.exe` name and the window class
+  `Chrome_WidgetWin_1` still say Chrome. They are compiled into the engine and
+  cannot be changed at runtime.
+- Canvas hashing, audio fingerprinting and font metrics are still measured from
+  the real machine.
+- Windows x64 only.
+
 ## [0.2.0] - 2026-10-06
 
 The slice becomes something you can hand to a person. `ghost.exe` is a single

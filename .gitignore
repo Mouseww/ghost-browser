@@ -16,6 +16,7 @@ _research/
 harness/chrome-profile*/
 harness/*_report.json
 harness/_*.txt
+harness/*.bmp
 *.log
 
 # ---- vendored MinHook ships its own build dir --------------------------

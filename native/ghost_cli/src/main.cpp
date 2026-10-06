@@ -19,13 +19,16 @@
 
 #include "../../common/probe_report.h"
 #include "chrome.h"
+#include "daemon.h"
 #include "embed.h"
+#include "json.h"
 #include "launch.h"
+#include "pipe.h"
 #include "profile_gen.h"
 
 namespace {
 
-constexpr const char* kVersion = "0.2.0";
+constexpr const char* kVersion = "0.3.0";
 constexpr const char* kDefaultId = "default";
 
 void print_usage() {
@@ -34,6 +37,8 @@ void print_usage() {
       "\n"
       "usage:\n"
       "  ghost browse [options] [url ...]      launch the browser under the shim\n"
+      "  ghost serve [options] [url ...]       launch the browser and drive it over a pipe\n"
+      "  ghost call [--pipe <name>] <json>     send one request to a running server\n"
       "  ghost run [options] -- <exe> [args]   run any program under the shim\n"
       "  ghost profile new [options]           create a profile\n"
       "  ghost profile show [options]          print a profile\n"
@@ -53,6 +58,8 @@ void print_usage() {
       "  --browser <which>    chrome (default), edge, or a path to an executable\n"
       "  --chrome-arg <arg>   extra browser argument (repeatable)\n"
       "  --user-data-dir <d>  where the browser keeps cookies and storage\n"
+      "  --pipe <name>        control pipe name (default: ghost-<profile id>)\n"
+      "  --attach <pid>       drive an already-running browser instead of launching one\n"
       "  --sandbox            keep Chromium's sandbox; renderer surfaces stay real\n"
       "  --no-wait            return as soon as the browser is running\n"
       "  --allow-unspoofed    start the target even if injection fails\n"
@@ -79,6 +86,8 @@ struct Options {
   std::string profile_file;
   std::string user_data_dir;
   std::vector<std::string> chrome_args;
+  std::string pipe_name;
+  std::string attach;
   bool verbose = false;
   bool wait = true;
   bool allow_unspoofed = false;
@@ -145,6 +154,10 @@ Options parse(const std::vector<std::string>& args) {
       o.user_data_dir = v;
     } else if (value_of(args, &i, "--chrome-arg", &v)) {
       o.chrome_args.push_back(v);
+    } else if (value_of(args, &i, "--pipe", &v)) {
+      o.pipe_name = v;
+    } else if (value_of(args, &i, "--attach", &v)) {
+      o.attach = v;
     } else if (a == "--verbose" || a == "-v") {
       o.verbose = true;
     } else if (a == "--no-wait") {
@@ -342,6 +355,13 @@ int cmd_browse(const Options& o) {
     // WebGL adapter needs. The renderer needs the whole sandbox off.
     lo.args.push_back("--disable-gpu-sandbox");
     lo.args.push_back("--no-sandbox");
+    // Chromium puts an "unsupported command-line flag" infobar on screen for the
+    // flags above. That banner is a visible automation tell in every screenshot
+    // and it steals about 56 px of viewport, which makes the page's reported
+    // innerHeight disagree with the profile. --test-type suppresses the banner;
+    // measured directly, it takes the infobar from three accessibility nodes to
+    // zero.
+    lo.args.push_back("--test-type");
   }
   for (const std::string& a : o.chrome_args) lo.args.push_back(a);
   // The parser files the first positional argument as a possible subcommand, so
@@ -666,6 +686,67 @@ int cmd_install(const Options& o) {
   return 0;
 }
 
+int cmd_serve(const Options& o) {
+  const ghost::BrowserInstall browser = ghost::find_browser(o.browser);
+
+  std::string path;
+  // Align the profile's user agent with the browser that is actually installed,
+  // so a version bump does not leave the identity claiming an old engine.
+  const std::string json = resolve_profile(o, browser.version, &path);
+  if (json.empty()) return 1;
+
+  ghost::ServeOptions so;
+  so.pipe_name = o.pipe_name;
+  so.profile_id = o.id;
+  so.profile_json = json;
+  so.timezone = json_string(json, "timezone_id");
+  so.locale = json_string(json, "locale");
+  so.browser = o.browser;
+  so.data_dir = o.user_data_dir.empty() ? ghost::join_path(profiles_dir(), o.id + ".data")
+                                        : o.user_data_dir;
+  so.chrome_args = o.chrome_args;
+  so.sandbox = o.sandbox;
+  so.verbose = o.verbose;
+
+  // The first positional is a possible subcommand, so a URL lands in `sub`.
+  if (!o.sub.empty()) so.urls.push_back(o.sub);
+  for (const std::string& a : o.rest) so.urls.push_back(a);
+
+  if (!o.attach.empty()) {
+    so.attach_pid = static_cast<DWORD>(std::strtoul(o.attach.c_str(), nullptr, 10));
+    if (so.attach_pid == 0) {
+      std::fprintf(stderr, "ghost: --attach needs a process id\n");
+      return 64;
+    }
+  }
+  return ghost::run_serve(so);
+}
+
+int cmd_call(const Options& o) {
+  // The same pipe the agent client uses, reachable by hand so the control plane
+  // can be debugged without a client in the way.
+  std::string request = o.sub;
+  for (const std::string& a : o.rest) {
+    if (!request.empty()) request += " ";
+    request += a;
+  }
+  if (request.empty()) {
+    std::fprintf(stderr, "ghost: call needs a JSON request, e.g. '{\"cmd\":\"status\"}'\n");
+    return 64;
+  }
+
+  const std::string pipe =
+      o.pipe_name.empty() ? ghost::default_pipe_name(o.id) : o.pipe_name;
+  std::string response;
+  std::string error;
+  if (!ghost::call_pipe(pipe, request, &response, &error, 30000)) {
+    std::fprintf(stderr, "ghost: %s\n", error.c_str());
+    return 1;
+  }
+  std::printf("%s\n", response.c_str());
+  return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -687,6 +768,8 @@ int main() {
     return 0;
   }
   if (o.command == "browse") return cmd_browse(o);
+  if (o.command == "serve") return cmd_serve(o);
+  if (o.command == "call") return cmd_call(o);
   if (o.command == "run") return cmd_run(o);
   if (o.command == "profile") return cmd_profile(o);
   if (o.command == "selftest") return cmd_selftest(o);

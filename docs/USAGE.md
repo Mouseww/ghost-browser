@@ -18,6 +18,8 @@ next to it. Drop `ghost.exe` anywhere and run it.
 ```
 usage:
   ghost browse [options] [url ...]      launch the browser under the shim
+  ghost serve [options] [url ...]       serve a JSON control plane on a named pipe
+  ghost call [options] <json>           send one request to a running control plane
   ghost run [options] -- <exe> [args]   run any program under the shim
   ghost profile new [options]           create a profile
   ghost profile show [options]          print a profile
@@ -28,6 +30,11 @@ usage:
   ghost version
   ghost help
 ```
+
+The browser window it opens is titled **Ghost Browser**, wears the project icon,
+and carries no "unsupported command-line flag" infobar. Three things still say
+Chrome and cannot be changed at runtime — `chrome://version`, the on-disk
+`chrome.exe` file name, and the window class `Chrome_WidgetWin_1`.
 
 ## 1. Check that it works (30 seconds, no browser needed)
 
@@ -121,7 +128,110 @@ adapter spoofing work; the renderer sandbox is unaffected.
 `run` is the escape hatch: same injection machinery, no browser discovery. The
 target's output is forwarded to your console.
 
-## 4. The profile
+## 4. Drive it from a program, without CDP
+
+`ghost serve` runs the browser behind a JSON control plane. The transport is a
+**named pipe** (`\\.\pipe\ghost-<id>`), never a TCP port, because a page can scan
+ports and cannot scan pipes. There is no `--remote-debugging-port`, no
+`Runtime.enable`, no injected utility script, and no `navigator.webdriver`.
+
+```powershell
+.\ghost.exe serve --id demo --pipe demo --tz Europe/London --locale en-GB https://example.com
+```
+
+It prints the browser pid and the pipe name, then serves one request per line:
+
+```jsonc
+{"cmd":"status"}
+{"cmd":"navigate","url":"https://example.com"}
+{"cmd":"tree","max_nodes":400}
+{"cmd":"find","role":"button","name":"Accept"}
+{"cmd":"click","role":"button","name":"Accept"}
+{"cmd":"type","text":"hello"}
+{"cmd":"key","keys":["ctrl","a"]}
+{"cmd":"scroll","delta":-600}
+{"cmd":"screenshot","path":"shot.bmp"}
+{"cmd":"shutdown"}
+```
+
+Every reply is `{"ok":true, ...}` or `{"ok":false,"error":"..."}`. Anything that
+needs the window waits up to 30 s for it to appear, so a client can send its
+first command the moment `serve` prints the pid.
+
+`shutdown` closes the browser it started, politely first (`WM_CLOSE`, so the
+profile is flushed) and by force if it will not go. That is deliberate: Chromium
+locks its `--user-data-dir` exclusively, so a browser left behind makes the next
+run's browser exit instantly and show no window at all. A session started with
+`--attach <pid>` owns nothing and leaves the browser running.
+
+### The Python client
+
+```python
+from tools.ghost_client import Ghost
+
+with Ghost("demo").start(url="https://example.com") as browser:
+    browser.wait_for(role="button", name="Accept")
+    browser.click(role="button", name="Accept")   # isTrusted
+    print(browser.tree(max_nodes=40))             # accessibility tree
+    browser.screenshot("shot.bmp")                # PrintWindow
+```
+
+`Ghost(...)` alone does nothing — call `.start()` (or use the
+`with Ghost("x").start(...) as g:` form). The client is a thin wrapper over
+`open(pipe, "r+b")`, so if you prefer another language the protocol is one JSON
+line each way.
+
+### Why nothing here is detectable
+
+| Need | How | What the page sees |
+|---|---|---|
+| input | `SendInput` | `isTrusted: true`, real hardware timestamps |
+| page structure | UI Automation tree | nothing — no binding, no script |
+| screenshot | `PrintWindow` | nothing |
+| cookies / storage | read the profile's SQLite | nothing |
+| navigation | `Ctrl+L`, then type the URL | ordinary typing |
+
+Mouse movement is interpolated (smoothstep easing with a slight vertical bow)
+rather than teleported, clicks hold for 35–90 ms, and typing sends
+`KEYEVENTF_UNICODE` per UTF-16 code unit, which ignores the keyboard layout
+entirely. `python tools/serve_check.py` measures all of this against a local page
+that reports its own state through `aria-label` — including a trusted/untrusted
+event counter, which ends at `trusted=109, untrusted=0`.
+
+### Cookies can only be read after the browser exits
+
+Chrome holds `Default/Network/Cookies` with **no sharing at all**: `CreateFileW`
+fails with `ERROR_SHARING_VIOLATION` (32) under every share mode, while other
+files in the same directory open normally. It is not an ACL or sandbox effect, so
+cookies are only readable once the browser has exited — which makes this a
+harvest-after-shutdown channel, and also why `cf_clearance` can be collected but
+not injected mid-session.
+
+Order matters in client code: `cookie_db()` asks the control plane where the
+profile lives, so resolve the path *before* calling `stop()`.
+
+```python
+db = browser.cookie_db()      # needs the control plane
+browser.stop()                # closes the browser
+print(browser.cookies(db=db)) # now readable
+```
+
+Two more things about that database, both of which cost real debugging time:
+
+- **Session cookies are never written to it.** A cookie without `max-age` or
+  `expires` lives only in the browser's memory. If you need a value after
+  shutdown, set an expiry.
+- **The `value` column is empty.** Chrome 154 keeps the real bytes in
+  `encrypted_value` as `b"v10"` + AES-256-GCM(`nonce(12) || ciphertext || tag(16)`),
+  with the key in `<data_dir>/Local State` under `os_crypt.encrypted_key`
+  (base64 of `b"DPAPI"` + a DPAPI-wrapped 32-byte key). The plaintext is **32
+  bytes of domain binding followed by the value**, so `ghost_check=ok` decrypts
+  to 32 unknown bytes then `ok`.
+
+`ghost_client` does all of that with `ctypes` against `crypt32` and `bcrypt`, so
+reading cookies still needs no third-party package.
+
+## 5. The profile
 
 Every spoofed value comes from one JSON file. `ghost profile new` generates one
 with a coherent machine preset chosen from the seed:
@@ -182,7 +292,7 @@ RX 6700 XT, UHD 630, Iris Xe) with matching core counts, memory, panel sizes,
 device ids and video memory. Editing the JSON by hand is supported; just keep the
 pairs above consistent.
 
-## 5. Verify it in a real browser
+## 6. Verify it in a real browser
 
 The repository has two graders. Both measure from **inside the renderer** and
 POST the result to a local collector — the only honest way to measure when there
@@ -206,7 +316,7 @@ the sandbox makes those structurally unreachable — a gap, not a failure.
 `run_detect.py` is roughly 50% flaky (`NO REPORT RECEIVED` from a Chrome startup
 race). Run it again.
 
-## 6. Building from source
+## 7. Building from source
 
 ```powershell
 cmake -S native -B native/build -A x64
@@ -220,7 +330,7 @@ Output lands in `native\build\bin`. MinHook is vendored under
 Stop any running Chrome before rebuilding: it holds `ghost_shim.dll` open and the
 link step fails with `LNK1104`.
 
-## 7. Troubleshooting
+## 8. Troubleshooting
 
 **`ghost: CreateProcess failed: 225`**
 `225` is `ERROR_VIRUS_INFECTED`: antivirus blocked the launch. "Create a
@@ -266,19 +376,20 @@ Correct and unavoidable. The log line `load_exit=0xC0000022` means
 `STATUS_ACCESS_DENIED` from a restricted token. Only the browser, GPU and
 utility processes are reachable.
 
-## 8. What is not implemented yet
+## 9. What is not implemented yet
 
 This is a vertical slice, not a finished product. Not built yet:
 
-- **No agent control API.** The original goal is a browser driven by an
-  automated agent without CDP; the control plane (`ghostd`) is designed in
-  `docs/ARCHITECTURE.md` §4 but not written. Today you can launch and spoof, but
-  you cannot yet drive the page programmatically. The planned approach is OS
-  input synthesis plus the accessibility tree, so that no debugging protocol
-  exists for a page to detect.
 - **No CAPTCHA solving.** The three-tier strategy (silent pass → local audio →
-  third-party API) is designed in §6, not implemented.
+  third-party API) is designed in `docs/ARCHITECTURE.md` §6, not implemented.
 - **Windows x64 only.** Linux and macOS are designed in §8 and not implemented.
 - **No canvas / audio / font-metric spoofing.** Canvas hashing, audio
   fingerprinting and font metrics are still measured from the real machine. See
   `docs/ARCHITECTURE.md` §11.5.
+- **Three things still say Chrome**, and cannot be changed at runtime because
+  they are compiled into the engine: `chrome://version`, the on-disk file name
+  `chrome.exe`, and the window class `Chrome_WidgetWin_1`. Only a source-level
+  build (Track B) can fix them.
+- **No CDP escape hatch.** `control.mode = "cdp-pipe"` is designed in
+  `docs/ARCHITECTURE.md` §4.3 as a fallback for tools that need the protocol, and
+  is not wired up. It would use `--remote-debugging-pipe`, never a TCP port.
