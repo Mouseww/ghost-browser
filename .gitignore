@@ -14,7 +14,7 @@ _research/
 
 # ---- harness runtime state ---------------------------------------------
 harness/chrome-profile*/
-harness/detect_report.json
+harness/*_report.json
 harness/_*.txt
 *.log
 

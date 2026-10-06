@@ -113,6 +113,15 @@ jobs:
           }
           Write-Host "smoke test passed: $($expect.Count)/$($expect.Count) assertions"
 
+      # ---- the shipped product -----------------------------------------
+      # See tools/verify_ghost.ps1: it copies ghost.exe alone into an empty
+      # directory, wipes the extraction cache and runs the self-test there, so a
+      # missing or stale embedded resource cannot hide behind the build tree.
+      - name: ghost.exe is self-contained
+        shell: pwsh
+        run: |
+          pwsh -File tools/verify_ghost.ps1 -GhostExe native\build\bin\ghost.exe
+
       - name: Upload build artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -151,18 +160,19 @@ jobs:
               print('ok', p)
           PY
 
-      - name: Every hook source file is listed in CMakeLists
+      - name: Every native source file is listed in CMakeLists
         run: |
           python - <<'PY'
-          import glob, os, re, sys
+          import glob, os, sys
           cmake = open('native/CMakeLists.txt', encoding='utf-8').read()
           missing = []
-          for src in glob.glob('native/ghost_shim/src/*.cpp'):
-              name = os.path.basename(src)
-              if name not in cmake:
-                  missing.append(name)
+          for pattern in ('native/*/src/*.cpp', 'native/*/*/src/*.cpp', 'native/*/*.cpp'):
+              for src in glob.glob(pattern):
+                  name = os.path.basename(src)
+                  if name not in cmake:
+                      missing.append(src)
           if missing:
               sys.exit('these sources are not referenced by native/CMakeLists.txt: '
-                       + ', '.join(missing))
-          print('all shim sources are referenced by CMakeLists.txt')
+                       + ', '.join(sorted(missing)))
+          print('every native source is referenced by CMakeLists.txt')
           PY

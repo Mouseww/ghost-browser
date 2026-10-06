@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -139,6 +140,13 @@ class Checks:
         ok = isinstance(haystack, str) and needle in haystack
         self.add("PASS" if ok else "FAIL", name, haystack, f"contains {needle!r}")
 
+    def contains_any(self, name, haystack, needles) -> None:
+        """Pass when any spelling is present — zones legitimately have several."""
+        wanted = [n for n in needles if n]
+        ok = isinstance(haystack, str) and any(n in haystack for n in wanted)
+        self.add("PASS" if ok else "FAIL", name, haystack,
+                 "contains any of " + repr(wanted))
+
     def not_contains(self, name, haystack, needle) -> None:
         ok = isinstance(haystack, str) and needle not in haystack
         self.add("PASS" if ok else "FAIL", name, haystack, f"excludes {needle!r}")
@@ -166,6 +174,67 @@ class Checks:
         return fails
 
 
+def zone_expectations(profile: dict) -> dict | None:
+    """The offsets and abbreviations the profile's own zone should produce.
+
+    These used to be hardcoded to Europe/London, so a perfectly correct spoof of
+    any other zone was reported as a failure. Deriving them from the profile also
+    means the check is a real test: the host zone is not the profile zone.
+    """
+    name = profile.get("timezone_id")
+    if not name:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        import datetime as _dt
+
+        tz = ZoneInfo(name)
+    except Exception:  # noqa: BLE001 - no tz database on this host
+        return None
+
+    jan = _dt.datetime(2026, 1, 15, 12, tzinfo=tz)
+    jul = _dt.datetime(2026, 7, 15, 12, tzinfo=tz)
+    jan_utc = int(round(jan.utcoffset().total_seconds() / 60))
+    jul_utc = int(round(jul.utcoffset().total_seconds() / 60))
+    return {
+        # JavaScript's getTimezoneOffset() is local - UTC, the opposite sign of
+        # the tz database's UTC - local.
+        "jan": -jan_utc,
+        "jul": -jul_utc,
+        "abbr_jan": jan.tzname() or "",
+        "abbr_jul": jul.tzname() or "",
+        # The abbreviation ICU prints when the zone has no unambiguous short
+        # name; this one is in the zone's own (UTC - local) sign.
+        "gmt_jan": gmt_style_abbreviation(jan_utc),
+        "gmt_jul": gmt_style_abbreviation(jul_utc),
+    }
+
+
+def gmt_style_abbreviation(offset_minutes: int) -> str:
+    """ICU prints GMT+8 rather than CST for zones with no unambiguous short name."""
+    sign = "+" if offset_minutes >= 0 else "-"
+    hours, minutes = divmod(abs(offset_minutes), 60)
+    return f"GMT{sign}{hours}" + (f":{minutes:02d}" if minutes else "")
+
+
+def number_format_expectation(locale: str) -> str:
+    """How 1234567.891 renders in *locale*, for the locales the generator emits."""
+    parts = re.split(r"[-_]", locale or "en-US")
+    lang = parts[0].lower()
+    region = parts[1].upper() if len(parts) > 1 else ""
+    decimal_comma = {"de", "it", "es", "pt", "nl", "tr", "sv", "pl", "ru", "da", "fi", "nb"}
+    if lang in decimal_comma or region in {"DE", "IT", "ES", "BR", "PT", "NL", "TR", "SE",
+                                           "PL", "RU"}:
+        return "1.234.567,891"
+    if lang == "fr":
+        return "1\u202f234\u202f567,891"  # ICU groups with a narrow no-break space
+    return "1,234,567.891"
+
+
+def _normalise_spaces(text: str) -> str:
+    return (text or "").replace("\u202f", " ").replace("\u00a0", " ")
+
+
 def build_checks(report: dict, profile: dict, sandboxed: bool = False) -> Checks:
     c = Checks()
 
@@ -182,7 +251,11 @@ def build_checks(report: dict, profile: dict, sandboxed: bool = False) -> Checks
     # NULL SID, grantable by no ordinary ACE), so LoadLibraryW of the shim fails with
     # STATUS_ACCESS_DENIED and no renderer-side hook can install. Those two values are
     # then unreachable by Track A and only Track B (source-level patches) can move them.
-    expected_mem_gib = max(1, min(8, round(profile["memory_total_bytes"] / (1024 ** 3))))
+    # The Device Memory API is specified to clamp to [0.25, 8], and this check
+    # used to assume that clamp. Chrome 154 does not apply it: measured against
+    # profiles of 4 and 32 GiB, navigator.deviceMemory returned 4 and 32. The
+    # profile value is what the renderer reports, so compare against it directly.
+    expected_mem_gib = max(1, round(profile["memory_total_bytes"] / (1024 ** 3)))
     if sandboxed:
         c.gap("navigator.hardwareConcurrency", report.get("hardwareConcurrency"),
               f"renderer sandbox: unreachable (profile wants {profile['cpu_hardware_concurrency']})")
@@ -199,7 +272,9 @@ def build_checks(report: dict, profile: dict, sandboxed: bool = False) -> Checks
     ua = report.get("userAgent", "")
     c.not_contains("userAgent excludes HeadlessChrome", ua, "HeadlessChrome")
     c.not_contains("userAgent excludes --enable-automation marker", ua, "automation")
-    c.contains("userAgent carries the profile Chrome version", ua, "Chrome/154.0.0.0")
+    ua_match = re.search(r"Chrome/[\d.]+", profile.get("user_agent", ""))
+    c.contains("userAgent carries the profile Chrome version", ua,
+               ua_match.group(0) if ua_match else "Chrome/")
     c.contains("userAgent platform token matches navigator.platform", ua,
                "Windows NT 10.0; Win64; x64")
 
@@ -220,11 +295,20 @@ def build_checks(report: dict, profile: dict, sandboxed: bool = False) -> Checks
     intl = report.get("intl", {})
     c.eq("Intl timeZone", intl.get("timeZone"), profile["timezone_id"])
     c.eq("locale", intl.get("locale"), profile["locale"])
-    c.eq("tz offset January (GMT)", intl.get("offsetJan"), 0)
-    c.eq("tz offset July (BST)", intl.get("offsetJul"), -60)
-    c.contains("January abbreviation is GMT", intl.get("tzAbbrevJan", ""), "GMT")
-    c.contains("July abbreviation is BST", intl.get("tzAbbrevJul", ""), "BST")
-    c.contains("number formatting follows en-GB", intl.get("numberFormat", ""), "1,234,567.891")
+    zone = zone_expectations(profile)
+    if zone is None:
+        c.note("timezone offsets", intl.get("offsetJan"),
+               f"no tz database entry for {profile.get('timezone_id')!r}")
+    else:
+        c.eq(f"tz offset January ({zone['abbr_jan']})", intl.get("offsetJan"), zone["jan"])
+        c.eq(f"tz offset July ({zone['abbr_jul']})", intl.get("offsetJul"), zone["jul"])
+        c.contains_any("January abbreviation", intl.get("tzAbbrevJan", ""),
+                       [zone["abbr_jan"], zone["gmt_jan"]])
+        c.contains_any("July abbreviation", intl.get("tzAbbrevJul", ""),
+                       [zone["abbr_jul"], zone["gmt_jul"]])
+    c.eq("number formatting follows the profile locale",
+         _normalise_spaces(intl.get("numberFormat", "")),
+         _normalise_spaces(number_format_expectation(profile["locale"])))
 
     # --- framework leakage ------------------------------------------------
     leaked = [k for k, v in (report.get("automationGlobals") or {}).items() if v]

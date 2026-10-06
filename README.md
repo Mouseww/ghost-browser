@@ -47,20 +47,39 @@ the harness refuses to score them either way. A `GAP` is not a pass — it is an
 
 ## Quick start (Windows, x64)
 
-Prerequisites: Visual Studio 2022 Build Tools (MSVC x64), Python 3.11.
+**The product is one file.** Download `ghost.exe` from the
+[latest release](https://github.com/Mouseww/ghost-browser/releases/latest) — no
+clone, no build, no DLLs, no profile to author:
 
 ```powershell
-# one-time: build the native shim and launcher
+.\ghost.exe selftest        # prove injection works on this machine (9/9)
+.\ghost.exe browse https://example.com
+```
+
+`ghost.exe` finds your Chrome (or Edge), generates a coherent machine profile
+from a seed, extracts its embedded shim into a content-addressed cache, and
+starts the browser suspended-then-injected. See [docs/USAGE.md](docs/USAGE.md)
+for the full command surface, the profile fields, and troubleshooting.
+
+### From source
+
+Prerequisites: Visual Studio Build Tools (MSVC x64), Python 3.11, CMake.
+
+```powershell
 python -m pip install cmake
 python -m cmake -S native -B native/build -G "Visual Studio 17 2022" -A x64
 python -m cmake --build native/build --config Release
 
-# run the fingerprint harness against a real Chrome
+# grade the built single file exactly as a user would run it
+python tools/product_check.py
+
+# grade the shim through the developer launcher, renderer sandbox on
 Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force
 python harness/run_detect.py --sandboxed --chrome-arg=--disable-gpu-sandbox
 ```
 
-Artifacts land in `native/build/bin/`: `ghost_shim.dll`, `ghost_launch.exe`, `probe.exe`.
+Artifacts land in `native/build/bin/`: `ghost.exe` (the product),
+`ghost_shim.dll`, `ghost_launch.exe` (the developer launcher) and `probe.exe`.
 
 > **Always stop Chrome before rebuilding.** A running Chrome holds `ghost_shim.dll` open
 > and the link step fails with `LNK1104: cannot open file 'ghost_shim.dll'`.
@@ -71,9 +90,10 @@ hooks; pass `--sandboxed` to keep the renderer sandboxed (those two checks then 
 > **The harness is currently flaky.** Roughly half of runs end in `NO REPORT RECEIVED` with
 > no crash event in the Windows event log, which points at a Chrome startup race rather than
 > a defect in the shim. Re-running it passes. This is why it is deliberately not wired into
-> CI — see [docs/CI.md](docs/CI.md).
+> CI — see [docs/CI.md](docs/CI.md). `tools/product_check.py` grades the same assertions
+> through the product and is the one CI runs.
 
-### Launching a browser directly
+### Driving the shim directly (development)
 
 ```powershell
 native\build\bin\ghost_launch.exe `
@@ -85,6 +105,7 @@ native\build\bin\ghost_launch.exe `
 
 Use `--no-sandbox` instead of `--disable-gpu-sandbox` if you also need the renderer-side
 values (`hardwareConcurrency`, `deviceMemory`); that gives up the renderer sandbox entirely.
+`ghost.exe browse` makes that trade-off for you and documents it in `ghost help`.
 
 The launcher starts the target `CREATE_SUSPENDED`, injects the shim, waits for a real
 in-process readiness handshake, and only then resumes it. **If injection fails it aborts

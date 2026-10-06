@@ -1,0 +1,87 @@
+name: release
+
+# Tag pushes only. The release asset is a single self-contained executable, so
+# the release is the product: whatever this workflow builds and verifies is what
+# users download.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to (re)release
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  windows-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The launcher creates a suspended process, writes a DLL path into it and
+      # starts a remote thread -- the shape of an injector, which Defender flags
+      # heuristically as Behavior:Win32/DefenseEvasion.A!ml. Excluding only the
+      # build output keeps the rest of the image protected.
+      - name: Exclude build output from Defender
+        shell: pwsh
+        run: |
+          Add-MpPreference -ExclusionPath (Join-Path $env:GITHUB_WORKSPACE 'native\build\bin') `
+            -ErrorAction SilentlyContinue
+
+      - name: Configure
+        run: cmake -S native -B native/build -A x64
+
+      - name: Build (Release)
+        run: cmake --build native/build --config Release
+
+      # Never publish a binary that cannot stand on its own.
+      - name: Verify ghost.exe is self-contained
+        shell: pwsh
+        run: |
+          pwsh -File tools/verify_ghost.ps1 -GhostExe native\build\bin\ghost.exe
+
+      - name: Stage the release assets
+        shell: pwsh
+        run: |
+          $dist = Join-Path $env:GITHUB_WORKSPACE 'dist'
+          New-Item -ItemType Directory -Path $dist -Force | Out-Null
+          Copy-Item 'native\build\bin\ghost.exe' $dist
+          $hash = (Get-FileHash (Join-Path $dist 'ghost.exe') -Algorithm SHA256).Hash.ToLower()
+          "$hash  ghost.exe" | Set-Content -LiteralPath (Join-Path $dist 'SHA256SUMS.txt') -Encoding ascii
+          Get-ChildItem $dist | Format-Table Name, Length
+          Get-Content (Join-Path $dist 'SHA256SUMS.txt')
+
+      - name: Resolve the tag
+        id: tag
+        shell: pwsh
+        run: |
+          $tag = if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
+            '${{ inputs.tag }}'
+          } else {
+            $env:GITHUB_REF_NAME
+          }
+          if ([string]::IsNullOrWhiteSpace($tag)) { throw 'could not determine the tag' }
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "releasing $tag"
+
+      - name: Build the release notes
+        run: python tools/release_notes.py ${{ steps.tag.outputs.tag }} --out release-notes.md
+
+      - name: Publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ steps.tag.outputs.tag }}'
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag dist/ghost.exe dist/SHA256SUMS.txt --clobber
+            gh release edit $tag --title "$tag" --notes-file release-notes.md
+          } else {
+            gh release create $tag --title "$tag" --notes-file release-notes.md `
+              dist/ghost.exe dist/SHA256SUMS.txt
+          }
+          gh release view $tag --json assets,url --jq '.url, (.assets[] | "\(.name)  \(.size)")'
