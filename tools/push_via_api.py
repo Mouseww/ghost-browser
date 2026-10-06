@@ -160,11 +160,33 @@ print(f"remote tip = {remote_tip}")
 # A commit can only exist remotely if its parents do, because the API refuses
 # to create a commit with an unknown parent. So the first commit we find that
 # already exists marks the end of the missing run.
+#
+# Existing as an object is NOT the same as being published. If the ref update
+# fails -- a dropped connection is enough -- the commits are left behind as
+# orphans while the branch still points at the old tip, and treating them as
+# published makes the next run print "nothing to publish" and exit 0 without
+# ever moving the ref. Only reachability from the remote tip counts.
+def commit_exists_locally(sha):
+    return subprocess.run(["git", "cat-file", "-e", sha + "^{commit}"],
+                          capture_output=True).returncode == 0
+
+
+def published_on_remote(sha, tip):
+    """True when `sha` is the remote tip, or an ancestor of it."""
+    if sha == tip:
+        return True
+    if not commit_exists_locally(tip):
+        # We cannot walk a tip we do not have, so only an exact match counts.
+        return False
+    return subprocess.run(["git", "merge-base", "--is-ancestor", sha, tip],
+                          capture_output=True).returncode == 0
+
+
 chain = sh("git", "rev-list", "HEAD").split()
 missing = []
 for sha in chain:                       # newest first
-    if remote_commit(sha):
-        print(f"already on the remote: {sha[:8]}")
+    if remote_commit(sha) and published_on_remote(sha, remote_tip):
+        print(f"already published on the remote: {sha[:8]}")
         break
     missing.append(sha)
 else:
@@ -175,6 +197,10 @@ if not missing:
     print("\nnothing to publish; the remote already has every commit")
     print(f"local  HEAD = {chain[0]}")
     print(f"remote HEAD = {remote_tip}")
+    if chain[0] != remote_tip:
+        sys.exit(f"!! the remote tip {remote_tip[:8]} is not the local HEAD "
+                 f"{chain[0][:8]}; the histories have diverged, re-run with "
+                 f"--force only if dropping the remote commits is intended")
     sys.exit(0)
 
 print(f"{len(missing)} commit(s) to publish: "
@@ -260,6 +286,15 @@ else:
     _, res = api("PATCH", f"/repos/{REPO}/git/refs/heads/{BRANCH}",
                  {"sha": new_tip, "force": True})
     print(f"\nupdated refs/heads/{BRANCH} -> {res['object']['sha']}")
+
+# Read the ref back. The whole point of this script is to move it, so claiming
+# success without checking is how a dropped connection turns into a silent
+# no-op that the next run then mistakes for "already published".
+_, ref_after = api("GET", f"/repos/{REPO}/git/ref/heads/{BRANCH}")
+if ref_after["object"]["sha"] != new_tip:
+    sys.exit(f"!! the ref update did not take: refs/heads/{BRANCH} is "
+             f"{ref_after['object']['sha'][:8]}, expected {new_tip[:8]}")
+print(f"verified refs/heads/{BRANCH} -> {new_tip}")
 
 # --------------------------------------------------------------------------
 # 4. put the local repository on the same SHAs
