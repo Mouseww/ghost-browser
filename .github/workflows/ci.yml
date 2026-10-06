@@ -35,8 +35,15 @@ jobs:
           Write-Host 'Defender exclusion paths:'
           (Get-MpPreference).ExclusionPath
 
+      # No -G on purpose. windows-latest currently resolves to the
+      # "windows-2025-vs2026" image, which ships Visual Studio 2026, not 2022,
+      # so a hardcoded "Visual Studio 17 2022" generator fails with
+      # "could not find any instance of Visual Studio". Letting CMake pick the
+      # newest installed Visual Studio keeps this job working as the image
+      # rolls forward. -A x64 stays explicit: the shim's handshake stub is
+      # x64-only machine code.
       - name: Configure
-        run: cmake -S native -B native/build -G "Visual Studio 17 2022" -A x64
+        run: cmake -S native -B native/build -A x64
 
       - name: Build (Release)
         run: cmake --build native/build --config Release
