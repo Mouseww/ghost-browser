@@ -1,0 +1,161 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# The native shim is Windows-only today (Track A). Linux/macOS are planned
+# (see docs/ARCHITECTURE.md §8) and will add their own jobs here.
+jobs:
+  # ---------------------------------------------------------------------
+  # Build the shim + launcher with MSVC and prove the spoofed OS values
+  # actually reach the target process.
+  #
+  # This is the meaningful automated regression: it needs no browser and no
+  # interactive desktop session, unlike harness/run_detect.py.
+  # ---------------------------------------------------------------------
+  windows-build-and-smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ghost_launch creates a suspended process, writes a DLL path into it and
+      # starts a remote thread. Windows Defender on the hosted image flags that
+      # pattern heuristically -- locally we hit
+      # "Behavior:Win32/DefenseEvasion.A!ml", which deleted the launcher and
+      # broke the build with WinError 225. Excluding only the build output
+      # directory keeps the rest of the image protected.
+      - name: Exclude build output from Defender
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:GITHUB_WORKSPACE 'native\build\bin'
+          Add-MpPreference -ExclusionPath $dir -ErrorAction SilentlyContinue
+          Write-Host 'Defender exclusion paths:'
+          (Get-MpPreference).ExclusionPath
+
+      - name: Configure
+        run: cmake -S native -B native/build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build (Release)
+        run: cmake --build native/build --config Release
+
+      # ---- negative control -------------------------------------------
+      # Run probe.exe with no shim at all. This proves the assertions below
+      # are measuring the shim and not coincidentally matching the runner.
+      - name: Control -- probe without the shim
+        shell: pwsh
+        run: |
+          $probe = Join-Path $env:GITHUB_WORKSPACE 'native\build\bin\probe.exe'
+          $out   = Join-Path $env:RUNNER_TEMP 'control.out'
+          $err   = Join-Path $env:RUNNER_TEMP 'control.err'
+          $p = Start-Process -FilePath $probe -WorkingDirectory $env:GITHUB_WORKSPACE `
+                 -WindowStyle Hidden -PassThru `
+                 -RedirectStandardOutput $out -RedirectStandardError $err
+          if (-not $p.WaitForExit(30000)) { $p.Kill(); throw 'control probe did not exit' }
+          $text = Get-Content $out -Raw
+          Write-Host $text
+          if ($text -notlike '*ghost_shim.dll loaded   = no*') {
+            throw 'control run unexpectedly had the shim loaded'
+          }
+
+      # ---- the real assertion -----------------------------------------
+      # Values chosen so a coincidence is implausible on a GitHub runner:
+      # 8 GiB total RAM (runner has 16), 3200x1800 display (runner is small),
+      # en-GB locale (runner is en-US).
+      - name: Smoke test -- spoofed OS values reach the target process
+        shell: pwsh
+        run: |
+          $gl    = Join-Path $env:GITHUB_WORKSPACE 'native\build\bin\ghost_launch.exe'
+          $probe = Join-Path $env:GITHUB_WORKSPACE 'native\build\bin\probe.exe'
+          $prof  = Join-Path $env:GITHUB_WORKSPACE 'harness\profiles\slice-test-001.json'
+          $out   = Join-Path $env:RUNNER_TEMP 'probe.out'
+          $err   = Join-Path $env:RUNNER_TEMP 'probe.err'
+
+          $p = Start-Process -FilePath $gl `
+                 -ArgumentList "--profile `"$prof`" --tz Europe/London -- `"$probe`"" `
+                 -WorkingDirectory $env:GITHUB_WORKSPACE -WindowStyle Hidden -PassThru `
+                 -RedirectStandardOutput $out -RedirectStandardError $err
+          if (-not $p.WaitForExit(90000)) { $p.Kill(); throw 'ghost_launch did not exit within 90s' }
+
+          Write-Host "launcher exit code: $($p.ExitCode)"
+          Get-Content $err -ErrorAction SilentlyContinue
+          $text = Get-Content $out -Raw
+          Write-Host $text
+
+          # ghost_launch is strict by default: it aborts if the shim fails to
+          # inject, rather than silently running an unspoofed browser.
+          if ($p.ExitCode -ne 0) { throw "ghost_launch exited with $($p.ExitCode)" }
+
+          $expect = @(
+            'ghost_shim.dll loaded   = yes',
+            'GetActiveProcessorCount = 4',
+            'dwNumberOfProcessors    = 4',
+            'ullTotalPhys            = 8589934592',
+            'GetSystemMetrics(CX)    = 3200',
+            'GetSystemMetrics(CY)    = 1800',
+            'GetDeviceCaps(LOGPIX)   = 120',
+            'GetDpiForMonitor        = 120 x 120',
+            'GetTimeZoneInformation  = ret=2 Bias=0 StandardBias=0 DaylightBias=-60',
+            'GetUserDefaultLocaleName= en-GB'
+          )
+          $missing = @($expect | Where-Object { $text -notlike "*$_*" })
+          if ($missing.Count -gt 0) {
+            throw "probe output is missing $($missing.Count) expected line(s):`n$($missing -join "`n")"
+          }
+          Write-Host "smoke test passed: $($expect.Count)/$($expect.Count) assertions"
+
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghost-native-windows-x64
+          path: |
+            native/build/bin/*.dll
+            native/build/bin/*.exe
+          if-no-files-found: warn
+          retention-days: 7
+
+  # ---------------------------------------------------------------------
+  # Cheap static checks on the tooling that the native job does not touch.
+  # ---------------------------------------------------------------------
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Byte-compile the Python tooling
+        run: python -m compileall -q harness tools
+
+      - name: Validate every profile is well-formed JSON
+        run: |
+          python - <<'PY'
+          import glob, json, sys
+          paths = sorted(glob.glob('harness/profiles/*.json'))
+          if not paths:
+              sys.exit('no profiles found')
+          for p in paths:
+              with open(p, encoding='utf-8') as fh:
+                  json.load(fh)
+              print('ok', p)
+          PY
+
+      - name: Every hook source file is listed in CMakeLists
+        run: |
+          python - <<'PY'
+          import glob, os, re, sys
+          cmake = open('native/CMakeLists.txt', encoding='utf-8').read()
+          missing = []
+          for src in glob.glob('native/ghost_shim/src/*.cpp'):
+              name = os.path.basename(src)
+              if name not in cmake:
+                  missing.append(name)
+          if missing:
+              sys.exit('these sources are not referenced by native/CMakeLists.txt: '
+                       + ', '.join(missing))
+          print('all shim sources are referenced by CMakeLists.txt')
+          PY

@@ -1,0 +1,378 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ghost detect</title>
+<style>
+  body { font: 13px/1.5 ui-monospace, Consolas, monospace; background:#111; color:#ddd; margin:16px; }
+  h1 { font-size:15px; color:#7fd; }
+  pre { white-space:pre-wrap; }
+  .ok { color:#6f6; } .bad { color:#f66; }
+</style>
+</head>
+<body>
+<h1 id="hdr">collecting…</h1>
+<pre id="out"></pre>
+<script>
+"use strict";
+// Report page-side failures too. A report that silently never arrives is the least
+// debuggable outcome there is, so every error path posts something.
+window.addEventListener("error", function (ev) {
+  try {
+    fetch("/report", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        phase: 2, __pageError: String(ev.message), __source: ev.filename,
+        __line: ev.lineno, __col: ev.colno,
+        __stack: ev.error && ev.error.stack ? String(ev.error.stack) : null
+      })
+    });
+  } catch (e) { /* nothing left to do */ }
+});
+window.addEventListener("unhandledrejection", function (ev) {
+  try {
+    fetch("/report", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ phase: 2, __unhandledRejection: String(ev.reason) })
+    });
+  } catch (e) { /* nothing left to do */ }
+});
+
+// Runs INSIDE the renderer process. Nothing here is injected by the harness — the
+// point is to read the fingerprint exactly as a normal page would, so that whatever
+// it reports is what a detector would see. It POSTs the result to the local collector
+// because the native control plane is deliberately CDP-free (no out-of-band channel
+// to read page state from outside the renderer).
+(function () {
+  function fnv1a(str) {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < str.length; i++) {
+      h ^= str.charCodeAt(i);
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return ("00000000" + h.toString(16)).slice(-8);
+  }
+  function safe(label, fn) {
+    try { return fn(); } catch (e) { return { __error: label + ": " + String(e) }; }
+  }
+  function nativeSource(obj, prop) {
+    const d = Object.getOwnPropertyDescriptor(obj, prop);
+    if (!d || !d.get) return null;
+    return Function.prototype.toString.call(d.get).slice(0, 160);
+  }
+
+  const r = {};
+  r.meta = {
+    href: location.href,
+    isSecureContext: window.isSecureContext,
+    crossOriginIsolated: window.crossOriginIsolated,
+    pageTime: new Date().toISOString()
+  };
+
+  // --- the headline automation signals -------------------------------------
+  r.webdriver = navigator.webdriver;
+  r.hardwareConcurrency = navigator.hardwareConcurrency;
+  r.deviceMemory = navigator.deviceMemory;
+  r.platform = navigator.platform;
+  r.userAgent = navigator.userAgent;
+  r.appVersion = navigator.appVersion;
+  r.vendor = navigator.vendor;
+  r.product = navigator.product;
+  r.productSub = navigator.productSub;
+  r.language = navigator.language;
+  r.languages = navigator.languages.slice();
+  r.pdfViewerEnabled = navigator.pdfViewerEnabled;
+  r.maxTouchPoints = navigator.maxTouchPoints;
+
+  // --- automation-specific globals (framework leakage) ----------------------
+  r.automationGlobals = {};
+  [
+    "cdc_adoQpoasnfa76pfcZLmcfl_Array", "cdc_adoQpoasnfa76pfcZLmcfl_Promise",
+    "cdc_adoQpoasnfa76pfcZLmcfl_Symbol", "_Selenium_IDE_Recorder",
+    "__selenium_unwrapped", "__webdriver_evaluate", "__driver_evaluate",
+    "__webdriver_script_fn", "__fxdriver_evaluate", "__nightmare",
+    "callPhantom", "_phantom", "phantom", "Buffer", "emit", "spawn",
+    "domAutomation", "domAutomationController", "__playwright__binding__",
+    "__pw_manual", "__pwInitScripts", "__puppeteer_evaluation_script__",
+    "cdc_asdjflasutopfhvcZLmcfl_"
+  ].forEach(function (k) { r.automationGlobals[k] = (k in window); });
+
+  // --- screen / window geometry --------------------------------------------
+  r.screen = {
+    width: screen.width, height: screen.height,
+    availWidth: screen.availWidth, availHeight: screen.availHeight,
+    availLeft: screen.availLeft, availTop: screen.availTop,
+    colorDepth: screen.colorDepth, pixelDepth: screen.pixelDepth,
+    isExtended: screen.isExtended,
+    orientationType: screen.orientation && screen.orientation.type,
+    orientationAngle: screen.orientation && screen.orientation.angle,
+    devicePixelRatio: window.devicePixelRatio,
+    innerWidth: window.innerWidth, innerHeight: window.innerHeight,
+    outerWidth: window.outerWidth, outerHeight: window.outerHeight,
+    screenX: window.screenX, screenY: window.screenY,
+    visualViewportScale: window.visualViewport && window.visualViewport.scale
+  };
+
+  // --- timezone / locale coherence -----------------------------------------
+  r.intl = safe("intl", function () {
+    const dtf = Intl.DateTimeFormat();
+    const ro = dtf.resolvedOptions();
+    return {
+      timeZone: ro.timeZone,
+      locale: ro.locale,
+      calendar: ro.calendar,
+      numberingSystem: ro.numberingSystem,
+      hourCycle: ro.hourCycle,
+      offsetJan: new Date(2026, 0, 15).getTimezoneOffset(),
+      offsetJul: new Date(2026, 6, 15).getTimezoneOffset(),
+      dateToString: new Date(2026, 0, 15).toString(),
+      // Formatted in the *default* locale on purpose. Hardcoding "en-US" made this probe
+      // assert en-US CLDR data (which renders Europe/London in July as "GMT+1") while the
+      // profile asks for en-GB (which renders "BST"), so it failed for a correct browser.
+      // Using the default locale is the real coherence test: does Intl agree with the
+      // locale the browser claims to be running in?
+      tzAbbrevJan: new Intl.DateTimeFormat(undefined, { timeZoneName: "short" })
+        .format(new Date(2026, 0, 15)),
+      tzAbbrevJul: new Intl.DateTimeFormat(undefined, { timeZoneName: "short" })
+        .format(new Date(2026, 6, 15)),
+      numberFormat: new Intl.NumberFormat().format(1234567.891),
+      collatorSort: ["z", "a", "ä", "b"].sort(new Intl.Collator().compare).join(""),
+      dateTimeFormat: dtf.format(new Date(2026, 0, 15, 13, 45, 6))
+    };
+  });
+
+  // --- WebGL ---------------------------------------------------------------
+  r.webgl = safe("webgl", function () {
+    const c = document.createElement("canvas");
+    const gl = c.getContext("webgl");
+    if (!gl) return { available: false };
+    const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+    const p = function (n) { try { return gl.getParameter(n); } catch (e) { return null; } };
+    return {
+      available: true,
+      vendor: p(gl.VENDOR),
+      renderer: p(gl.RENDERER),
+      version: p(gl.VERSION),
+      shadingLanguageVersion: p(gl.SHADING_LANGUAGE_VERSION),
+      unmaskedVendor: dbg ? p(dbg.UNMASKED_VENDOR_WEBGL) : null,
+      unmaskedRenderer: dbg ? p(dbg.UNMASKED_RENDERER_WEBGL) : null,
+      hasDebugRendererInfo: !!dbg,
+      maxTextureSize: p(gl.MAX_TEXTURE_SIZE),
+      maxViewportDims: p(gl.MAX_VIEWPORT_DIMS),
+      maxRenderbufferSize: p(gl.MAX_RENDERBUFFER_SIZE),
+      maxVertexAttribs: p(gl.MAX_VERTEX_ATTRIBS),
+      maxVaryingVectors: p(gl.MAX_VARYING_VECTORS),
+      maxFragmentUniformVectors: p(gl.MAX_FRAGMENT_UNIFORM_VECTORS),
+      maxCombinedTextureUnits: p(gl.MAX_COMBINED_TEXTURE_IMAGE_UNITS),
+      aliasedLineWidthRange: p(gl.ALIASED_LINE_WIDTH_RANGE),
+      aliasedPointSizeRange: p(gl.ALIASED_POINT_SIZE_RANGE),
+      extensionCount: (gl.getSupportedExtensions() || []).length,
+      hasWebgl2: !!c.getContext("webgl2")
+    };
+  });
+
+  // --- canvas / audio: the known Blink-internal gap -------------------------
+  r.canvas = safe("canvas", function () {
+    const c = document.createElement("canvas");
+    c.width = 220; c.height = 40;
+    const g = c.getContext("2d");
+    g.textBaseline = "top";
+    g.font = "16px Arial";
+    g.fillStyle = "#f60";
+    g.fillRect(0, 0, 220, 40);
+    g.fillStyle = "#069";
+    g.fillText("ghost-browser-\u4e2d\u6587-\ud83d\ude00", 4, 10);
+    g.fillStyle = "rgba(102,204,0,0.7)";
+    g.fillText("ghost-browser-\u4e2d\u6587-\ud83d\ude00", 6, 22);
+    const url = c.toDataURL();
+    const px = g.getImageData(0, 0, 220, 40).data;
+    let sum = 0;
+    for (let i = 0; i < px.length; i += 997) sum = (sum + px[i]) >>> 0;
+    return { dataUrlHash: fnv1a(url), dataUrlLength: url.length, pixelSampleSum: sum };
+  });
+
+  r.audio = safe("audio", function () {
+    const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    if (!OAC) return { available: false };
+    const ctx = new OAC(1, 44100, 44100);
+    const osc = ctx.createOscillator();
+    osc.type = "triangle";
+    osc.frequency.value = 10000;
+    const comp = ctx.createDynamicsCompressor();
+    comp.threshold.value = -50; comp.knee.value = 40; comp.ratio.value = 12;
+    comp.attack.value = 0; comp.release.value = 0.25;
+    osc.connect(comp); comp.connect(ctx.destination);
+    osc.start(0);
+    return new Promise(function (resolve) {
+      ctx.startRendering().then(function (buf) {
+        const d = buf.getChannelData(0);
+        let sum = 0;
+        for (let i = 4500; i < 5000; i++) sum += Math.abs(d[i]);
+        resolve({ available: true, fingerprint: sum.toString() });
+      }).catch(function (e) { resolve({ available: true, error: String(e) }); });
+    });
+  });
+
+  // --- font metrics --------------------------------------------------------
+  r.fonts = safe("fonts", function () {
+    const c = document.createElement("canvas");
+    const g = c.getContext("2d");
+    const measure = function (font, text) {
+      g.font = "72px " + font;
+      return g.measureText(text).width;
+    };
+    const probe = function (font) {
+      const a = measure(font, "mmmmmmmmmmlli");
+      const b = measure("monospace", "mmmmmmmmmmlli");
+      const c2 = measure("sans-serif", "mmmmmmmmmmlli");
+      return a !== b && a !== c2;
+    };
+    const candidates = ["Arial", "Helvetica", "Times New Roman", "Courier New",
+      "Segoe UI", "Calibri", "Tahoma", "Verdana", "Georgia", "Impact",
+      "Comic Sans MS", "Trebuchet MS", "Cambria", "Consolas", "Lucida Console",
+      "MS Gothic", "MS PGothic", "SimSun", "SimHei", "Microsoft YaHei",
+      "Noto Sans", "DejaVu Sans", "Liberation Sans", "Roboto", "Ubuntu"];
+    const present = candidates.filter(probe);
+    return {
+      present: present,
+      presentCount: present.length,
+      probeWidths: {
+        arial: measure("Arial", "ghost\u4e2d\u6587"),
+        fallback: measure("sans-serif", "ghost\u4e2d\u6587"),
+        serif: measure("serif", "ghost\u4e2d\u6587")
+      }
+    };
+  });
+
+  // --- native-ness of the surfaces we hook ---------------------------------
+  r.nativeGetters = {
+    webdriver: nativeSource(Navigator.prototype, "webdriver"),
+    hardwareConcurrency: nativeSource(Navigator.prototype, "hardwareConcurrency"),
+    deviceMemory: nativeSource(Navigator.prototype, "deviceMemory"),
+    platform: nativeSource(Navigator.prototype, "platform"),
+    userAgent: nativeSource(Navigator.prototype, "userAgent"),
+    languages: nativeSource(Navigator.prototype, "languages"),
+    screenWidth: nativeSource(Screen.prototype, "width"),
+    screenHeight: nativeSource(Screen.prototype, "height"),
+    devicePixelRatio: nativeSource(Object.getOwnPropertyDescriptor(
+      Window.prototype, "devicePixelRatio") ? Window.prototype : window, "devicePixelRatio")
+  };
+  r.nativeToStringSelf = Function.prototype.toString.call(Function.prototype.toString);
+
+  // --- performance.now() precision -----------------------------------------
+  r.timing = safe("timing", function () {
+    const samples = [];
+    for (let i = 0; i < 12; i++) {
+      const t0 = performance.now();
+      let t1 = t0;
+      let guard = 0;
+      while (t1 === t0 && guard++ < 1000000) t1 = performance.now();
+      samples.push(t1 - t0);
+    }
+    return {
+      minDelta: Math.min.apply(null, samples),
+      hasPerformanceMemory: !!(performance.memory),
+      timeOrigin: performance.timeOrigin
+    };
+  });
+
+  // --- plugins / mimeTypes -------------------------------------------------
+  r.plugins = safe("plugins", function () {
+    return {
+      pluginCount: navigator.plugins.length,
+      names: Array.prototype.map.call(navigator.plugins, function (p) { return p.name; }),
+      mimeCount: navigator.mimeTypes.length
+    };
+  });
+
+  // --- chrome object / permissions -----------------------------------------
+  r.chrome = safe("chrome", function () {
+    return {
+      hasChrome: !!window.chrome,
+      chromeKeys: window.chrome ? Object.keys(window.chrome) : [],
+      hasRuntime: !!(window.chrome && window.chrome.runtime),
+      hasLoadTimes: !!(window.chrome && window.chrome.loadTimes),
+      hasCsi: !!(window.chrome && window.chrome.csi)
+    };
+  });
+  r.notificationPermission = (typeof Notification !== "undefined")
+    ? Notification.permission : null;
+
+  // --- CDP port probe: what a detector would try against us -----------------
+  r.cdpProbe = new Promise(function (resolve) {
+    const ports = [9222, 9223, 9229, 9515];
+    const out = {};
+    let pending = ports.length;
+    const done = function () { if (--pending === 0) resolve(out); };
+    ports.forEach(function (port) {
+      let settled = false;
+      const finish = function (v) { if (!settled) { settled = true; out[port] = v; done(); } };
+      const timer = setTimeout(function () { finish("no-response"); }, 1500);
+      let ws;
+      try {
+        ws = new WebSocket("ws://127.0.0.1:" + port + "/devtools/browser");
+        ws.onopen = function () { clearTimeout(timer); ws.close(); finish("OPEN"); };
+        ws.onerror = function () { clearTimeout(timer); finish("closed"); };
+      } catch (e) { clearTimeout(timer); finish("throw"); }
+    });
+  });
+
+  // --- permissions consistency ---------------------------------------------
+  r.permissionState = new Promise(function (resolve) {
+    if (!navigator.permissions) return resolve(null);
+    navigator.permissions.query({ name: "notifications" })
+      .then(function (s) { resolve(s.state); })
+      .catch(function (e) { resolve("error:" + String(e)); });
+  });
+
+  // --- reporting, in two phases ---------------------------------------------
+  // Phase 1 carries every synchronous field and goes out immediately. The async
+  // probes (audio rendering, CDP port scan, permissions) follow in phase 2 behind a
+  // timeout, so a single hanging probe can no longer swallow the whole report — which
+  // is exactly what happened before this split: the collector saw the page fetch and
+  // then nothing at all, with no way to tell a hang from a crash.
+  function post(payload) {
+    return fetch("/report", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+  }
+  function withTimeout(promise, ms, fallback) {
+    return Promise.race([
+      Promise.resolve(promise),
+      new Promise(function (res) { setTimeout(function () { res(fallback); }, ms); })
+    ]);
+  }
+
+  const phase1 = Object.assign({}, r, { phase: 1 });
+  delete phase1.audio;
+  delete phase1.cdpProbe;
+  delete phase1.permissionState;
+
+  post(phase1).then(function () {
+    document.getElementById("hdr").textContent = "phase 1 reported; probing extras\u2026";
+    return Promise.all([
+      withTimeout(r.audio, 5000, { __timeout: true }),
+      withTimeout(r.cdpProbe, 4000, { __timeout: true }),
+      withTimeout(r.permissionState, 3000, { __timeout: true })
+    ]);
+  }).then(function (vals) {
+    const full = Object.assign({}, r, {
+      audio: vals[0], cdpProbe: vals[1], permissionState: vals[2], phase: 2
+    });
+    document.getElementById("out").textContent = JSON.stringify(full, null, 2);
+    return post(full);
+  }).then(function () {
+    document.getElementById("hdr").textContent = "reported \u2713";
+    document.getElementById("hdr").className = "ok";
+  }).catch(function (e) {
+    document.getElementById("hdr").textContent = "report failed: " + e;
+    document.getElementById("hdr").className = "bad";
+  });
+})();
+</script>
+</body>
+</html>

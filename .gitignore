@@ -1,0 +1,31 @@
+# ---- build output -------------------------------------------------------
+native/build/
+build/
+CMakeCache.txt
+CMakeFiles/
+*.vcxproj
+*.vcxproj.filters
+*.sln
+.vs/
+
+# ---- research scratch (mirrored third-party sources, ~22 MB) ------------
+_research/
+.tmp/
+
+# ---- harness runtime state ---------------------------------------------
+harness/chrome-profile*/
+harness/detect_report.json
+harness/_*.txt
+*.log
+
+# ---- vendored MinHook ships its own build dir --------------------------
+native/vendor/minhook/build/
+
+# ---- python -------------------------------------------------------------
+__pycache__/
+*.py[cod]
+
+# ---- os ----------------------------------------------------------------
+Thumbs.db
+desktop.ini
+.DS_Store
