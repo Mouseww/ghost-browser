@@ -9,11 +9,14 @@ This repository currently contains **Track A — the native shim vertical slice*
 end-to-end path from a profile file to a launched browser that passes a 34-assertion
 fingerprint coherence harness, including WebGL vendor/renderer spoofing.
 
-**Just want to run it?** The [v0.1.0 release](https://github.com/Mouseww/ghost-browser/releases/tag/v0.1.0)
-ships prebuilt binaries and a sample profile, and **[docs/USAGE.md](docs/USAGE.md)** walks
-through using them — the 30-second probe check, launching a real browser through the shim,
-what each profile field means, and what is deliberately not spoofed. Cloning and building
-are only needed for the fingerprint test page under `harness/`.
+**Just want to run it?** Download `ghost.exe` from the
+[latest release](https://github.com/Mouseww/ghost-browser/releases/latest) — that one file
+is the whole product, with nothing to install and no companion DLLs, profiles or config to
+place beside it. Run `ghost.exe selftest` to prove it works on your machine, then
+`ghost.exe browse https://example.com`. **[docs/USAGE.md](docs/USAGE.md)** walks through the
+rest: the 30-second probe check, launching a real browser through the shim, what each
+profile field means, and what is deliberately not spoofed. Cloning and building are only
+needed to work on the source or run the fingerprint test page under `harness/`.
 
 ---
 
