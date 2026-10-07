@@ -137,7 +137,7 @@ There is no `Runtime.enable`, no injected utility script, and no port for a page
 is `SendInput` — interpolated mouse paths rather than teleports, 35–90 ms press durations, and
 `KEYEVENTF_UNICODE` typing that ignores the keyboard layout. The page is read through UI
 Automation, and screenshots come from `PrintWindow`. `python tools/serve_check.py` grades all of
-it against a local page that reports its own state through `aria-label` — **17 checks, 0 failed**,
+it against a local page that reports its own state through `aria-label` — **19 checks, 0 failed**,
 including that every event the page received was `isTrusted`.
 
 Cookies are the one thing that cannot be read live: Chrome holds `Default/Network/Cookies` with
@@ -147,6 +147,70 @@ steps — session cookies never reach the database, and the `value` column is al
 Chrome 154 stores `b"v10"` + AES-256-GCM in `encrypted_value`, with the key DPAPI-wrapped in
 `Local State`. The client undoes all of it with `crypt32` and `bcrypt` through `ctypes`, so there
 is still no third-party dependency.
+
+### Installing it on your PATH
+
+`ghost.exe` runs from wherever you put it, but `ghost install` copies it to
+`%LOCALAPPDATA%\GhostBrowser\bin` and prepends that directory to your user `PATH`
+(`HKCU\Environment\Path`), so `ghost` works from any shell. It broadcasts
+`WM_SETTINGCHANGE`, so shells that are already open may need a restart to see it.
+`ghost uninstall` reverses both steps. That is the entire installation: one file, one
+user environment variable. No service, no scheduled task, no registry key beyond that
+`PATH` entry, and no administrator rights.
+
+### Using it from your language
+
+The control plane is a Windows named pipe carrying one JSON object per line, so a
+client is about sixty lines in any language that can open a file: write a request
+followed by `\n`, read until `\n`. [docs/PROTOCOL.md](docs/PROTOCOL.md) is the full
+specification, and [examples/](examples) has a client that was compiled and run
+against a live browser for each language:
+
+| Language | Client | Run it |
+|---|---|---|
+| Python | [tools/ghost_client.py](tools/ghost_client.py) | `python tools/serve_check.py` |
+| C# / .NET | [examples/dotnet](examples/dotnet) | `dotnet run --project examples/dotnet` |
+| Go | [examples/go](examples/go) | `go run examples/go/ghost.go` |
+| Rust | [examples/rust](examples/rust) | `cargo run --manifest-path examples/rust/Cargo.toml` |
+| Node.js | [examples/node](examples/node) | `node examples/node/example.js` |
+
+If you would rather not take on a dependency at all, every language can shell out to
+the one-shot client instead:
+
+```bash
+ghost call '{"cmd":"navigate","url":"https://example.com"}' --id demo
+ghost call '{"cmd":"tree","max_nodes":50}' --id demo
+```
+
+`ghost call` opens the pipe, sends one request, prints one JSON reply and exits — no
+long-lived process, no library, no build step. That path works from a shell script, a
+Makefile, or a CI job as readily as from an application.
+
+### Using it from an agent
+
+Two pieces, because they answer different questions.
+
+**The MCP server** ([mcp/ghost_mcp.py](mcp/ghost_mcp.py)) supplies the capability:
+twelve tools covering open, navigate, read, find, wait, click, type, key, scroll,
+screenshot and close. It is a single standard-library Python file, it owns the
+browser's lifecycle, it renders the accessibility tree as text an LLM can act on
+(`[14] button "Sign in" @144,256`), and it converts screenshots to PNG because MCP
+image content does not carry BMP.
+
+```bash
+claude mcp add ghost -- python /absolute/path/to/mcp/ghost_mcp.py
+```
+
+[mcp/README.md](mcp/README.md) has the generic `mcpServers` JSON, the tool table and
+the environment variables. `python tools/mcp_check.py` drives the whole thing the way
+a client does and reports **29 checks, 0 failed**.
+
+**The skill** ([skills/ghost/SKILL.md](skills/ghost/SKILL.md)) supplies the judgement:
+when this browser is the right tool and when an HTTP client is, the
+navigate → read → act → re-read loop, and the failure that otherwise looks like a bug —
+synthesized input is silently discarded on a disconnected desktop session, so a click
+appears to do nothing. An MCP server alone leaves an agent to rediscover that every
+time.
 
 ### The window says "Ghost Browser"
 
@@ -325,6 +389,7 @@ detection services.
 ```
 native/
   common/inject.h          injection, PE export parsing, remote loader-list walk
+  common/probe_report.*    the single definition of what "spoofed" means
   ghost_shim/              the DLL that is injected into the browser
     src/hooks_sysinfo.cpp    CPU count, memory
     src/hooks_display.cpp    screen geometry, DPI
@@ -333,20 +398,36 @@ native/
     src/hooks_dwrite.cpp     DirectWrite font collection (document.fonts, measureText)
     src/hooks_proc.cpp       child-process propagation
     src/hook_engine.*        MinHook wrapper
+  ghost_cli/               the single shipped file, ghost.exe
+    src/main.cpp             subcommand dispatch
+    src/daemon.cpp           the control plane (`ghost serve`)
+    src/uia.cpp              accessibility-tree reads and the priming fix
+    src/pipe.cpp             the named pipe
+    src/input.cpp, window.cpp, capture.cpp, pipe.cpp   OS input, window capture
   ghost_launch/            the launcher and injector
   tests/probe/             ground-truth value dumper (run with and without the shim)
 harness/
   detect.html              in-renderer fingerprint collector
   run_detect.py            orchestrator + assertion table
   profiles/                profile files
+mcp/ghost_mcp.py           MCP server: the browser as tools an agent can call
+skills/ghost/SKILL.md      when to reach for it, and the failures that look like bugs
+examples/                  C#, Go, Rust and Node clients, each run against a live browser
 tools/
+  ghost_client.py          the Python control-plane client (DPAPI + AES-GCM cookies)
+  product_check.py         end-to-end acceptance of the single shipped file
+  serve_check.py           control-plane acceptance
+  mcp_check.py             MCP acceptance
+  verify_ghost.ps1         proves ghost.exe is self-contained
   pe_exports.py            dependency-free PE export-table parser
   token_sids.ps1           process token / integrity / restricted-SID dumper
   mitigations.ps1          process mitigation policy dumper
+  push_via_api.py          publish through the Git Data API when :443 is blocked
 docs/
+  PROTOCOL.md              the control-plane wire protocol
+  USAGE.md                 how to run it
   ARCHITECTURE.md          full design, incl. the Track B plan
   CI.md                    what runs on free runners vs. a self-hosted one
-  superpowers/plans/       the implementation plan
 .github/workflows/ci.yml   MSVC build + probe smoke test (with a negative control)
 ```
 

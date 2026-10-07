@@ -102,6 +102,10 @@ bool refresh(Session& session, std::string* error) {
     const WindowInfo info = main_window(session.pid);
     if (info.handle != nullptr) {
       session.window = info.handle;
+      // Some navigations replace the window, and a replacement starts with its
+      // accessibility tree switched off again, so prime whenever the handle is new
+      // rather than only once at startup.
+      prime_accessibility(session.window, 3000);
       return true;
     }
     if (GetTickCount64() >= deadline) break;
@@ -393,17 +397,12 @@ Json cmd_screenshot(Session& session, const Json& request) {
   return out;
 }
 
-Json cmd_call(const std::string& pipe_name, const Json& request) {
-  const std::string command = arg_string(request, "cmd");
-  if (command.empty()) return failure("call needs a cmd");
-  std::string response;
-  std::string error;
-  if (!call_pipe(pipe_name, request.dump(), &response, &error, 60000)) return failure(error);
-  std::string parse_error;
-  Json parsed = Json::parse(response, &parse_error);
-  if (!parse_error.empty()) return failure("the server returned invalid JSON: " + parse_error);
-  return parsed;
-}
+// There is deliberately no "call" command here. One existed until 0.5.0 and it
+// forwarded the incoming request back down the same pipe, so {"cmd":"call"}
+// re-entered itself and hung until the client's timeout. A nested request has no
+// meaning anyway: this process *is* the server, and a client that wants to relay
+// should open its own connection. `ghost call` is the CLI-side one-shot client,
+// which is a different thing and is where that name belongs.
 
 Json dispatch(Session& session, const Json& request, bool* stop) {
   const std::string command = arg_string(request, "cmd");
@@ -422,7 +421,6 @@ Json dispatch(Session& session, const Json& request, bool* stop) {
   if (command == "key") return cmd_key(session, request);
   if (command == "scroll") return cmd_scroll(session, request);
   if (command == "screenshot") return cmd_screenshot(session, request);
-  if (command == "call") return cmd_call(session.pipe_name, request);
   if (command == "shutdown") {
     *stop = true;
     return success();
@@ -533,6 +531,19 @@ int run_serve(const ServeOptions& options) {
       return launch_code;
     }
     wait_for_window(session.pid, 20000);
+  }
+
+  // Switch the renderer's accessibility tree on before any client gets to ask, so
+  // the first `tree` or `find` sees the document rather than a tree made entirely
+  // of browser chrome. Doing it here rather than on demand keeps the cost off the
+  // first request and needs no extra command-line flag.
+  {
+    std::string prime_error;
+    if (refresh(session, &prime_error) && session.window != nullptr) {
+      const bool ready = prime_accessibility(session.window, 8000);
+      std::printf("ghost serve: accessibility %s\n", ready ? "ready" : "not ready");
+      std::fflush(stdout);
+    }
   }
 
   std::printf("ghost serve: pid %lu, pipe \\\\.\\pipe\\%s\n", session.pid,

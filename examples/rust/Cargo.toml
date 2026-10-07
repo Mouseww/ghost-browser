@@ -1,0 +1,14 @@
+[package]
+name = "ghost-client"
+version = "0.1.0"
+edition = "2021"
+description = "Dependency-free Rust client for the ghost browser control protocol"
+publish = false
+
+# Deliberately empty. The protocol is one JSON object per line over a named
+# pipe, so the standard library is the whole dependency list.
+[dependencies]
+
+[[bin]]
+name = "ghost-client"
+path = "src/main.rs"

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -251,11 +252,15 @@ def build_checks(report: dict, profile: dict, sandboxed: bool = False) -> Checks
     # NULL SID, grantable by no ordinary ACE), so LoadLibraryW of the shim fails with
     # STATUS_ACCESS_DENIED and no renderer-side hook can install. Those two values are
     # then unreachable by Track A and only Track B (source-level patches) can move them.
-    # The Device Memory API is specified to clamp to [0.25, 8], and this check
-    # used to assume that clamp. Chrome 154 does not apply it: measured against
-    # profiles of 4 and 32 GiB, navigator.deviceMemory returned 4 and 32. The
-    # profile value is what the renderer reports, so compare against it directly.
-    expected_mem_gib = max(1, round(profile["memory_total_bytes"] / (1024 ** 3)))
+    # The Device Memory API is specified to clamp to [0.25, 8], and this check used
+    # to assume that clamp. Chrome 154 does not apply it, and it has a ceiling of
+    # its own: measured against profiles of 4, 8, 16, 32, 48 and 64 GiB,
+    # navigator.deviceMemory returned 4, 8, 16, 32, 32 and 32. So a real 64 GiB
+    # machine reports 32, and a profile that says 64 GiB must report 32 as well.
+    # Expecting the raw profile size here would fail a spoof that is behaving
+    # exactly like the browser it imitates.
+    gib = profile["memory_total_bytes"] / (1024 ** 3)
+    expected_mem_gib = max(1, min(32, 2 ** int(math.floor(math.log2(gib)))))
     if sandboxed:
         c.gap("navigator.hardwareConcurrency", report.get("hardwareConcurrency"),
               f"renderer sandbox: unreachable (profile wants {profile['cpu_hardware_concurrency']})")

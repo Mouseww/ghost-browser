@@ -329,6 +329,29 @@ std::vector<Element> find_elements(HWND window, const std::string& role,
   return walk_window(window, max_depth, max_nodes, false, role, name_contains, error);
 }
 
+bool prime_accessibility(HWND window, int timeout_ms) {
+  if (window == nullptr || !IsWindow(window)) return false;
+  if (timeout_ms <= 0) timeout_ms = 3000;
+
+  // The query below is itself the trigger: asking is what makes Chromium build the
+  // tree, so the first iteration is never wasted even when it finds nothing.
+  const ULONGLONG deadline = GetTickCount64() + static_cast<ULONGLONG>(timeout_ms);
+  std::string error;
+  for (;;) {
+    const std::vector<Element> nodes = dump_tree(window, 32, 800, true, &error);
+    for (const Element& element : nodes) {
+      // RootWebArea is the document root's automation id, and no piece of browser
+      // chrome ever carries it. Matching on either signal keeps this honest even if
+      // a future Chromium renames one of them.
+      if (element.role == "document" || element.automation_id == "RootWebArea") {
+        return true;
+      }
+    }
+    if (GetTickCount64() >= deadline) return false;
+    Sleep(120);
+  }
+}
+
 bool element_center(const Element& element, int* x, int* y) {
   const int width = element.bounds.right - element.bounds.left;
   const int height = element.bounds.bottom - element.bounds.top;

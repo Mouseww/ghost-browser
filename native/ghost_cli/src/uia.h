@@ -43,4 +43,19 @@ std::vector<Element> find_elements(HWND window, const std::string& role,
 // SendInput wants.
 bool element_center(const Element& element, int* x, int* y);
 
+// Waits for the page's document to appear in the accessibility tree, and returns
+// true if it did.
+//
+// Chromium builds that tree lazily: the first UI Automation query is what switches
+// accessibility on, and the document shows up in a later query. A client that asks
+// exactly once, right after the browser starts, therefore sees a tree made only of
+// browser chrome — no headings, no links, no text — and has every reason to
+// conclude the page is empty. Priming once at startup makes the first real query
+// correct, and unlike --force-renderer-accessibility it leaves no extra flag on the
+// command line.
+//
+// Returns false on timeout, which is not fatal: a browser still on about:blank has
+// no document to find, and the caller should carry on regardless.
+bool prime_accessibility(HWND window, int timeout_ms);
+
 }  // namespace ghost

@@ -26,6 +26,13 @@ native/vendor/minhook/build/
 __pycache__/
 *.py[cod]
 
+# ---- example clients (the sources are the deliverable, not the binaries) -
+examples/dotnet/bin/
+examples/dotnet/obj/
+examples/rust/target/
+examples/go/ghostclient
+examples/go/ghostclient.exe
+
 # ---- os ----------------------------------------------------------------
 Thumbs.db
 desktop.ini

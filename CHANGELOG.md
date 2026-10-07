@@ -5,7 +5,63 @@ All notable changes to this project are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0] - 2026-10-07
+
+### Added
+
+- **The control plane is specified.** [`docs/PROTOCOL.md`](docs/PROTOCOL.md) documents
+  the transport, the line-delimited JSON framing, all twelve commands with their
+  arguments and replies, the error each can return, and a fifteen-line client. The
+  protocol had existed since 0.3.0 without a specification, which is an odd place to
+  leave the interface this browser exists to expose.
+- **A client for every common language.** [`examples/`](examples) holds C#, Go, Rust
+  and Node clients, each compiled and run against a live browser;
+  [`tools/ghost_client.py`](tools/ghost_client.py) remains the Python one. None of
+  them needs a dependency — each opens a file and exchanges lines of JSON.
+  `ghost call '<json>'` covers the case where a program would rather link nothing.
+- **An MCP server**, [`mcp/ghost_mcp.py`](mcp/ghost_mcp.py): twelve tools over stdio,
+  standard library only. It starts and stops the browser itself, renders the
+  accessibility tree as text an agent can act on (`[14] button "Sign in" @144,256`),
+  and converts the BMP captures to PNG because MCP image content carries only PNG and
+  JPEG. [`tools/mcp_check.py`](tools/mcp_check.py) spawns it the way a client does and
+  drives a real page through it.
+- **A skill**, [`skills/ghost/SKILL.md`](skills/ghost/SKILL.md): when this browser is
+  the right tool, the navigate → read → act → re-read loop, and the failure modes that
+  look like bugs. An MCP server supplies capability; it cannot supply judgement.
+
+### Fixed
+
+- **The first `tree` or `find` after a browser started returned only browser
+  chrome, as if the page were empty.** Chromium builds its accessibility tree
+  lazily: the first UI Automation query is what switches it on, and the document
+  appears in a *later* query. Measured on a fresh profile, querying once a second:
+  the query at +0.22 s saw 57 nodes and no document, while the query at +1.37 s saw
+  65 nodes with the document and its seven text nodes. An agent that called
+  `ghost_page` once and concluded the page had no content was being misled by us,
+  not by the page. `ghost serve` now primes accessibility as soon as the window
+  appears, and again whenever a navigation replaces the window handle, so the first
+  query a client makes is already correct. The fix needs no extra flag;
+  `--force-renderer-accessibility` also works but puts a visible automation tell on
+  the command line, which is exactly what this browser exists to avoid.
+
+- **`navigator.deviceMemory` is capped at 32 GiB by Chrome, and the acceptance suite
+  expected the profile's raw size.** The profile generator offers a 64 GiB machine,
+  and a run using it failed with `actual=32 expected=64`. Measured against profiles
+  of 4, 8, 16, 32, 48 and 64 GiB, Chrome 154 reported 4, 8, 16, 32, 32 and 32 — so a
+  real 64 GiB machine reports 32 as well, the spoof was behaving correctly, and the
+  expectation was what needed fixing. `harness/run_detect.py` now derives what Chrome
+  derives: the physical memory rounded down to a power of two, capped at 32 GiB.
+
+- **`ghost serve` answered `{"cmd":"call"}` by forwarding the request to its own
+  pipe**, re-entering the same single-threaded server and deadlocking until the 60 s
+  timeout. `ghost call` is the client, and that name belongs to it; the command now
+  returns `unknown command: call` immediately.
+
+- **Three protocol details the clients disagreed with the documentation about.**
+  `--pipe` is the literal pipe name rather than a suffix, so `serve --id foo --pipe bar`
+  listens on `\\.\pipe\bar`; `find` with no matches is a success carrying
+  `count: 0`, not a failure; and `status.pipe` returns the bare name while `status.pid`
+  is the server's pid rather than the launcher's. All three are now written down.
 
 ## [0.4.0] - 2026-10-06
 
