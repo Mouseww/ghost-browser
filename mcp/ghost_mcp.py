@@ -45,7 +45,7 @@ PROTOCOL_VERSION = "2025-06-18"
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 
 SERVER_NAME = "ghost"
-SERVER_VERSION = "0.6.0"
+SERVER_VERSION = "0.7.0"
 
 DEFAULT_ID = os.environ.get("GHOST_ID") or "mcp"
 READY_TIMEOUT = float(os.environ.get("GHOST_TIMEOUT") or 60)
@@ -492,15 +492,21 @@ TOOLS = [
             "including the sitekey. With action='solve' it clicks the checkbox and "
             "waits: Cloudflare Turnstile is usually answered outright, while "
             "hCaptcha and reCAPTCHA escalate to an image or audio challenge that a "
-            "person still has to solve."
+            "person still has to solve. With action='solve-audio' it opens the audio "
+            "challenge, records what the machine actually plays through the OS audio "
+            "stack, transcribes the digits locally and types them back."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["detect", "solve"],
+                "action": {"type": "string", "enum": ["detect", "solve", "solve-audio"],
                            "default": "solve"},
                 "timeout": {"type": "integer", "default": 30000,
                             "description": "milliseconds to keep watching"},
+                "seconds": {"type": "integer", "default": 10,
+                            "description": "seconds of audio to record for solve-audio"},
+                "language": {"type": "string",
+                             "description": "speech recogniser culture, e.g. en-US"},
             },
             "additionalProperties": False,
         },
@@ -524,8 +530,27 @@ def tool_result(text: str, is_error: bool = False) -> dict:
 
 def run_tool(session: Session, name: str, args: dict) -> dict:
     if name == "ghost_open":
-        session.ensure()
         url = args.get("url")
+        if url and not session._alive():
+            # Starting *at* the URL costs no synthesized input, which is what makes
+            # this work in a session with no foreground window. Navigating afterwards
+            # drives the address bar and does need one, so it is only the fallback.
+            session.url = url
+            session.ensure()
+            title = ""
+            deadline = time.time() + 20.0
+            first = None
+            while time.time() < deadline:
+                status = session.call("status")
+                title = (status.get("window") or {}).get("title") or ""
+                if first is None and title:
+                    first = title
+                if title and first is not None and title != first:
+                    break
+                time.sleep(0.5)
+            return tool_result(f"opened {url}\ntitle: {title}")
+
+        session.ensure()
         if url:
             response = session.call("navigate", url=url)
             return tool_result(f"opened {url}\ntitle: {response.get('title')}")
@@ -631,8 +656,12 @@ def run_tool(session: Session, name: str, args: dict) -> dict:
 
     if name == "ghost_captcha":
         action = args.get("action") or "solve"
-        response = session.call("captcha", action=action,
-                                timeout=int(args.get("timeout", 30000)))
+        params = {"action": action, "timeout": int(args.get("timeout", 30000))}
+        if action == "solve-audio":
+            params["seconds"] = int(args.get("seconds", 10))
+            if args.get("language"):
+                params["language"] = args["language"]
+        response = session.call("captcha", **params)
         provider = response.get("provider", "none")
         state = response.get("state", "?")
         if provider == "none":
@@ -647,14 +676,37 @@ def run_tool(session: Session, name: str, args: dict) -> dict:
             lines.append(f"detail:   {response['detail']}")
         if action == "solve":
             lines.append(f"clicked:  {bool(response.get('clicked'))}")
+        if action == "solve-audio":
+            # The level and the stream list are what separate "the challenge
+            # played nothing" from "nothing ever opened a stream", and they are
+            # the first thing worth knowing when the answer comes back empty.
+            if response.get("device"):
+                lines.append(f"device:   {response['device']}")
+            if response.get("captured_seconds") is not None:
+                lines.append(f"captured: {response['captured_seconds']}s")
+            if response.get("peak") is not None:
+                lines.append(f"peak:     {response['peak']}")
+            if response.get("streams"):
+                lines.append(f"streams:  {response['streams']}")
+            if response.get("heard"):
+                lines.append(f"heard:    {response['heard']}")
+            if response.get("confidence") is not None:
+                lines.append(f"conf:     {response['confidence']}")
+            if response.get("typed"):
+                lines.append(f"typed:    {response['typed']}")
 
         if state == "solved":
             lines.append("the challenge is answered")
         elif state == "visual":
             lines.append("an image challenge is open; a person still has to solve it")
         elif state == "audio":
-            lines.append("an audio challenge is open — this is the route that can be "
-                         "solved automatically once local speech-to-text is wired up")
+            if action == "solve-audio":
+                lines.append("the audio challenge was recorded and transcribed"
+                             if response.get("heard")
+                             else "an audio challenge is open, but nothing usable was heard")
+            else:
+                lines.append("an audio challenge is open — use action='solve-audio' to "
+                             "record it and answer it automatically")
         return tool_result("\n".join(lines))
 
     if name == "ghost_screenshot":

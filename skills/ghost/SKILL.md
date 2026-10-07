@@ -33,8 +33,12 @@ and Node.
 ## The loop
 
 1. **Open** — `ghost_open` (or `ghost serve`) starts the browser. It is a full
-   Chromium window on the desktop, not headless.
-2. **Go** — `ghost_navigate` with a URL. It types into the real address bar.
+   Chromium window on the desktop, not headless. Passing `url` to `ghost_open` while
+   nothing is running starts the browser *at* that page, which needs no synthesized
+   input at all — do that rather than opening empty and navigating, and the read-only
+   tools keep working even in a session with no foreground window.
+2. **Go** — `ghost_navigate` with a URL. It types into the real address bar, so it
+   needs a foreground-capable session.
 3. **Read** — `ghost_page` returns the accessibility tree as text lines:
    `[14] button "Sign in" @144,256`. The number in brackets is the index.
 4. **Act** — pass that index straight to `ghost_click`, or use `ghost_type` /

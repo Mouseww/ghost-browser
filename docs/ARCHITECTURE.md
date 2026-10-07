@@ -673,9 +673,8 @@ mask 恢复默认后 `19 checks, 0 failed`。**证明移除它们的就是字体
 ### 14.5 还没做的
 
 - **图像挑战不求解。** 这是有意的：本项目其余部分都不假装做到了没做到的事。
-- **音频挑战不转写。** 入口已经打开（能点开、能读到 `audio-response` 输入框），但采集与 STT
-  未做。计划是 **WASAPI 环回采集浏览器实际播放的音频**，而不是去下载音频 URL —— 那样既不
-  需要注入，也不依赖挑战的 URL 结构，而且拿到的就是浏览器真正听到的东西。
+- **音频挑战的自动求解见 §14.6。** 入口、采集与本地转写都已实现；端到端仍有一个未结案的
+  测量（见该节末尾）。
 - **第③级打码 API 未做。** 所需的 sitekey 与 `bft` token 现在已经能读出来了。
 - **`cf_clearance` 的持久化不用自己做。** 它就是一个普通 cookie，Chromium 本来就会把它写进
   profile 的 Cookies 库，所以同一个 profile 第二次访问就不再被挑战。这既是好事（通过一次
@@ -684,4 +683,51 @@ mask 恢复默认后 `19 checks, 0 failed`。**证明移除它们的就是字体
   全部藏起来。实测：复用 profile 时 `nopecha.com/demo/cloudflare` 直接给 demo 页，树里一个
   widget 都没有，而全新 profile 三次里三次都在 3–5 秒内看到 Cloudflare 的全页 Turnstile
   挑战（`请稍候…` + `challenges.cloudflare.com` frame + `请验证您是真人` 复选框）。
+
+### 14.6 第二级：环回采集 + 本地语音识别
+
+这一级要回答的是「零 CDP 下怎么拿到音频挑战的题」。答案不是去下载音频 URL，而是**让操作系统
+把浏览器真正播放过的样本交回来**：浏览器播放时样本必然经过 OS 音频栈，而 OS 会把渲染端点的
+样本交给任何申请 loopback 的人。于是不需要注入、不需要读页面、不需要知道挑战的 URL 结构，
+拿到的是机器真正播过的东西，而不是对「挑战打算播什么」的猜测。
+
+实现分三块：
+
+| 文件 | 职责 |
+|---|---|
+| `native\ghost_cli\src\audio_capture.cpp` | WASAPI 共享模式环回采集（`AUDCLNT_STREAMFLAGS_LOOPBACK`），报电平而不只报成功；另给出渲染端点表（含音量/静音）与**音频会话表** |
+| `native\ghost_cli\src\speech.cpp` | SAPI 5 本地识别（`CLSID_SpInprocRecognizer` + 引擎 token），数字专用 SRGS 语法 |
+| `native\ghost_cli\src\daemon.cpp` | 控制面的 `captcha` 命令新增 `action=solve-audio`：点开音频挑战 → 起采集线程 → 点重放 → 转写 → 回填 → 提交 |
+
+三个实测结论：
+
+1. **环回采集本身工作正常。** 播放 3 s 440 Hz 正弦时 `ghost __audio 6 out.wav` 报
+   `远程音频 44100 Hz 2ch 32-bit 3.44s`、`peak 0.610321`、`rms 0.428018`。
+2. **浏览器音频确实进得了环回。** 一个 `<audio autoplay loop>` 页面（加
+   `--autoplay-policy=no-user-gesture-required`，因此**不需要任何输入合成**）在采集里给出
+   `peak 0.610340`、`rms 0.427081`、`silent 0 frames`；同一时刻音频会话表里 Chrome 是
+   `active peak 0.6000`，播放前则是 `inactive peak 0.0000`。
+3. **数字专用语法是数量级的差别。** 12 个随机 5 位数字串（本机 TTS 合成）：听写语法
+   2/12 全对、17/60 位（28.3%）、置信度约 0.02；数字语法 **10/12 全对、58/60 位（96.7%）、
+   置信度 0.73–0.99**。前置 0/250/500 ms 静音结果完全相同，所以丢数字是声学模型错误，而不是
+   起始点被截断。
+
+`__audio` 与 `__speech` 是隐藏的排障命令（`ghost __audio list|sessions|<秒> [wav]`、
+`ghost __speech list|<wav> [lang] [--digits]`）。它们报电平、报是谁在播、报识别置信度，因为
+这一层真正有意思的失败不是「端点打不开」（那会直接返回错误），而是端点打开了却什么都没听到
+——而「页面没播」和「根本没开流」在样本里长得一模一样。音频会话表就是为区分这两者加的，它
+显示的就是 Windows 音量合成器画的那份数据。
+
+**本机的两个诚实限制：**
+
+- **reCAPTCHA 音频挑战在每一次到达 `state=audio` 的运行里都采到 `peak 0`。** 采集链路已被上面
+  第 1、2 条证明正常，所以问题在「那次挑战到底有没有播」。为此 `solve-audio` 的回报里加了
+  `streams` 字段（当时是谁持有流、active 还是 inactive、电平多少），但**当前这个 RDP 会话没有
+  前台窗口**（`GetForegroundWindow()` 返回 0），Windows 会静默丢弃合成输入，点击无法进行，
+  这个判定还没跑完。**这一条是未结案的，不是已解决的。**
+- **本机没有英文识别器。** `HKLM:\SOFTWARE\Microsoft\Speech\Recognizers\Tokens` 下只有
+  `MS-2052-80-DESK`（zh-CN），`Speech_OneCore` 下只有 `MS-2052-110-WINMO-DNN`，安装英文识别器
+  需要管理员权限。因此英文的 reCAPTCHA 音频挑战在这台机器上**无法本地转写**；`ghost __speech`
+  对未知语言走诚实降级路径（`no recognizer for "en" is installed (installed: zh-CN)`），不会
+  假装听懂。
 

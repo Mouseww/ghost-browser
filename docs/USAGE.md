@@ -443,6 +443,7 @@ is already running (`ghost serve --id work` in another window):
 ```
 ghost call --id work "{\"cmd\":\"captcha\"}"                          # detect, then try to solve
 ghost call --id work "{\"cmd\":\"captcha\",\"action\":\"detect\"}"    # only report
+ghost call --id work "{\"cmd\":\"captcha\",\"action\":\"solve-audio\",\"language\":\"en-US\"}"
 ```
 
 A solved Cloudflare Turnstile looks like this:
@@ -463,7 +464,7 @@ A solved Cloudflare Turnstile looks like this:
 | `absent` | no widget on the page, or one is mid-verification | nothing, or wait |
 | `checkbox` | a widget is showing its checkbox | click it — that is what `solve` does |
 | `visual` | an image challenge is open | **stop** — nothing here solves it |
-| `audio` | an audio challenge is open | **stop** — nothing here transcribes it yet |
+| `audio` | an audio challenge is open | `action=solve-audio` records it and types the answer |
 | `solved` | the widget is gone | continue |
 
 What actually happens today, measured against the three real challenges
@@ -475,13 +476,55 @@ What actually happens today, measured against the three real challenges
 | hCaptcha | sitekey read, checkbox clicked, image challenge opens |
 | reCAPTCHA v2 | sitekey read, checkbox clicked, image challenge opens; the audio button is reachable and opens the audio challenge |
 
+### Solving the audio challenge
+
+`action=solve-audio` takes the route that does not need to see the page: it opens
+the audio challenge, starts recording the default output device in loopback mode,
+asks for a replay so the clip starts inside the recording window, transcribes the
+digits locally and types them back. Nothing is downloaded and no URL is parsed —
+what gets transcribed is what the machine actually played.
+
+```json
+{
+  "provider": "recaptcha",
+  "state": "audio",
+  "device": "Speakers (Realtek)",
+  "captured_seconds": 9.9,
+  "peak": 0.61,
+  "streams": "pid 4128 active peak 0.6000",
+  "heard": "37194",
+  "confidence": 0.91,
+  "typed": "37194",
+  "solved": true
+}
+```
+
+Three fields are there for when it does *not* work, because "it heard nothing" has
+two very different causes and the samples cannot tell them apart:
+
+- `peak` and `rms` — the level of what was captured. Zero means silence.
+- `streams` — who was holding a stream on the output device at that moment, and
+  how loud. This is the same list the Windows volume mixer draws. If it is empty,
+  the page never played anything and retrying will not help; if a browser process
+  is `active` with a non-zero peak while `peak` is zero, the recording is at fault.
+- `confidence` — how sure the recogniser was. A wrong answer costs an attempt, so
+  a low-confidence answer is reported as such rather than submitted blindly.
+
+Two honest limits on this machine, both written into
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §14.6: local speech-to-text needs a
+recogniser for the challenge's language (**only a Chinese one is installed here**,
+and installing an English one needs administrator rights), and the reCAPTCHA audio
+challenge measured `peak 0` in every run that reached it, which is still being
+explained.
+
 Two things are worth saying plainly. **A widget that is already there is not a
 failure** — Turnstile often passes with no visible challenge at all, and hCaptcha
 and reCAPTCHA only decide to escalate after you click. And **do not retry in a
 loop**: repeated attempts are themselves a bot signal and make things worse, not
 better. Ask once, report what you got, move on.
 
-From an agent the same thing is one MCP call — `ghost_captcha`.
+From an agent the same thing is one MCP call — `ghost_captcha`, with
+`action="solve-audio"` for the audio route.
 
 ## 10. What is not implemented yet
 

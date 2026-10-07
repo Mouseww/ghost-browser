@@ -18,6 +18,8 @@
 #include <vector>
 
 #include "../../common/probe_report.h"
+#include "audio_capture.h"
+#include "speech.h"
 #include "chrome.h"
 #include "daemon.h"
 #include "embed.h"
@@ -28,7 +30,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "0.6.0";
+constexpr const char* kVersion = "0.7.0";
 constexpr const char* kDefaultId = "default";
 
 void print_usage() {
@@ -93,6 +95,7 @@ struct Options {
   bool allow_unspoofed = false;
   bool sandbox = false;
   bool force = false;
+  bool digits = false;
 };
 
 bool has_prefix(const std::string& s, const char* prefix) {
@@ -168,6 +171,8 @@ Options parse(const std::vector<std::string>& args) {
       o.sandbox = true;
     } else if (a == "--force") {
       o.force = true;
+    } else if (a == "--digits") {
+      o.digits = true;
     } else if (a == "--help" || a == "-h") {
       o.command = "help";
     } else if (a == "--version") {
@@ -624,6 +629,133 @@ int cmd_probe(const Options& o) {
   return 0;
 }
 
+// Hidden on purpose; not listed in usage(). This is how the audio tier is
+// measured from a shell, and the only part of it that can be tested without a
+// challenge on screen:
+//
+//   ghost __audio list          what a capture could listen to
+//   ghost __audio sessions      who is playing, and how loudly, right now
+//   ghost __audio 5             capture five seconds and report the level
+//   ghost __audio 5 out.wav     ...and keep it
+//   ghost __speech list         which languages this machine can transcribe
+//   ghost __speech out.wav en   transcribe it, keeping only the digits
+//   ghost __speech out.wav en --digits   ...listening for digits and nothing else
+//
+// It reports the level rather than just "ok", because the interesting failure is
+// not "the endpoint would not open" -- that comes back as an error -- but "it
+// opened and heard nothing", which is what a machine with no speakers, a muted
+// endpoint, or a session whose audio is not being rendered all look like.
+int cmd_audio(const Options& o) {
+  if (o.sub == "list") {
+    const std::vector<ghost::AudioDevice> devices = ghost::list_render_devices();
+    if (devices.empty()) {
+      std::printf("no active audio output device\n");
+      return 1;
+    }
+    for (const ghost::AudioDevice& device : devices) {
+      char vol[48] = "";
+      if (device.volume >= 0.0f) {
+        std::snprintf(vol, sizeof(vol), "  %.0f%%%s", device.volume * 100.0f,
+                      device.muted ? " muted" : "");
+      }
+      std::printf("%s %s%s\n", device.is_default ? "*" : " ", device.name.c_str(), vol);
+    }
+    return 0;
+  }
+
+  if (o.sub == "sessions") {
+    // What the volume mixer would show: which processes hold a stream on the
+    // default endpoint, and how loud each one is right now. A capture that came
+    // back silent is ambiguous without this -- "the page played nothing" and
+    // "nothing ever opened a stream" look identical in the samples.
+    std::string error;
+    const std::vector<ghost::AudioSession> sessions = ghost::list_audio_sessions(&error);
+    if (sessions.empty()) {
+      std::printf("no audio sessions%s%s\n", error.empty() ? "" : ": ",
+                  error.c_str());
+      return error.empty() ? 0 : 1;
+    }
+    static const char* kStates[] = {"inactive", "active", "expired"};
+    for (const ghost::AudioSession& session : sessions) {
+      const char* state = (session.state >= 0 && session.state <= 2)
+                              ? kStates[session.state]
+                              : "unknown";
+      std::printf("pid %-8lu %-9s peak %.4f%s%s\n",
+                  static_cast<unsigned long>(session.pid), state,
+                  static_cast<double>(session.peak),
+                  session.system_sounds ? "  system sounds" : "",
+                  session.name.empty() ? "" : ("  " + session.name).c_str());
+    }
+    return 0;
+  }
+
+  double seconds = 5.0;
+  if (!o.sub.empty()) seconds = std::atof(o.sub.c_str());
+  if (seconds <= 0.0 || seconds > 600.0) {
+    std::printf("ghost: capture length must be between 0 and 600 seconds\n");
+    return 64;
+  }
+  const std::string out = o.rest.empty() ? std::string() : o.rest.front();
+
+  std::printf("capturing %.1fs of loopback audio...\n", seconds);
+  const ghost::CaptureResult capture =
+      ghost::capture_loopback(seconds, std::string(), out);
+  if (!capture.ok) {
+    std::printf("capture failed: %s\n", capture.error.c_str());
+    return 1;
+  }
+  std::printf("device    %s\n", ghost::describe_capture(capture).c_str());
+  std::printf("frames    %llu\n", static_cast<unsigned long long>(capture.frames));
+  std::printf("silent    %llu frames\n",
+              static_cast<unsigned long long>(capture.silent_frames));
+  std::printf("peak      %.6f\n", capture.peak);
+  std::printf("rms       %.6f\n", capture.rms);
+  if (!capture.wav_path.empty()) {
+    std::printf("wav       %s\n", capture.wav_path.c_str());
+  }
+  return 0;
+}
+
+// Local transcription, so that "what did the challenge say" is answered by the
+// machine's own speech engine rather than by a model shipped inside this exe.
+// `list` exists because the interesting failure is not a bad transcript but no
+// recognizer for the challenge's language at all, and that is worth seeing
+// before blaming the audio.
+int cmd_speech(const Options& o) {
+  if (o.sub == "list") {
+    const std::vector<ghost::Recognizer> recognizers = ghost::list_recognizers();
+    if (recognizers.empty()) {
+      std::printf("no speech recognizer is installed\n");
+      return 1;
+    }
+    for (const ghost::Recognizer& r : recognizers) {
+      std::printf("%s  %s  %s\n", r.id.c_str(),
+                  r.culture.empty() ? "(unknown)" : r.culture.c_str(),
+                  r.description.c_str());
+    }
+    return 0;
+  }
+  if (o.sub.empty()) {
+    std::printf("ghost: __speech needs a wave file, or \"list\"\n");
+    return 64;
+  }
+  const std::string language = o.rest.empty() ? std::string() : o.rest.front();
+  const ghost::Transcript transcript =
+      ghost::recognize_wav(o.sub, language, o.digits);
+  if (!transcript.ok) {
+    std::printf("speech failed: %s\n", transcript.error.c_str());
+    return 1;
+  }
+  std::printf("recognizer %s\n", transcript.recognizer.c_str());
+  std::printf("text       %s\n", transcript.text.c_str());
+  std::printf("digits     %s\n", transcript.digits.c_str());
+  std::printf("confidence %.4f\n", transcript.confidence);
+  for (size_t i = 0; i < transcript.alternatives.size(); ++i) {
+    std::printf("alt[%zu]     %s\n", i, transcript.alternatives[i].c_str());
+  }
+  return 0;
+}
+
 // Adding the install directory to the user PATH is the closest thing to an
 // installer that a portable executable can honestly offer.
 int cmd_install(const Options& o) {
@@ -776,6 +908,8 @@ int main() {
   if (o.command == "doctor") return cmd_doctor(o);
   if (o.command == "install") return cmd_install(o);
   if (o.command == "__probe") return cmd_probe(o);
+  if (o.command == "__audio") return cmd_audio(o);
+  if (o.command == "__speech") return cmd_speech(o);
 
   std::fprintf(stderr, "ghost: unknown command '%s'\n\n", o.command.c_str());
   print_usage();

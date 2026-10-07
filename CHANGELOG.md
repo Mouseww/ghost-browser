@@ -5,6 +5,49 @@ All notable changes to this project are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-10-07
+
+### Added
+
+- **The audio challenge route: record what the machine actually played, then
+  transcribe it locally.** `captcha` on the control plane takes
+  `action=solve-audio`, and `ghost_captcha` in the MCP server exposes it. It opens
+  the audio challenge, records the default output device in WASAPI loopback mode,
+  asks for a replay so the clip starts inside the recording window, transcribes the
+  digits with the Windows speech engine and types them back. Nothing is downloaded
+  and no URL is parsed: the samples came through the OS audio stack, so they are
+  what the browser really played. Verified end to end that the capture path works —
+  a plain `<audio autoplay loop>` page records at `peak 0.610340`, `rms 0.427081`,
+  `silent 0 frames`, with no input synthesis at all.
+- **A digit-only grammar, which is the difference between unusable and usable.**
+  Free dictation spends its probability mass on words; a captcha answer needs
+  digits. Over 12 random five-digit strings synthesised locally, dictation scored
+  **2/12 exact, 17/60 digits (28.3%)** at confidence ≈0.02, while the SRGS digit
+  grammar scored **10/12 exact, 58/60 digits (96.7%)** at confidence 0.73–0.99.
+  Padding the clip with 0/250/500 ms of silence changed nothing, so the misses are
+  acoustic-model errors rather than a clipped onset.
+- `ghost __audio list|sessions|<seconds> [out.wav]` and
+  `ghost __speech list|<wav> [lang] [--digits]`, hidden diagnostics that report the
+  level, who is playing and how sure the recogniser was. A capture that came back
+  silent is ambiguous — the page may have played nothing, or nothing may have opened
+  a stream at all — and the session list is the same data the Windows volume mixer
+  draws, so the two can be told apart.
+- `solve-audio` reports `peak`, `rms`, `streams` and `confidence` alongside the
+  transcript, because a wrong answer costs an attempt and "it heard nothing" needs
+  to be diagnosable from the response alone.
+
+### Known limitations
+
+- **The reCAPTCHA audio challenge measured `peak 0` in every run that reached it**,
+  including with autoplay permitted, while a plain page on the same machine records
+  at `peak 0.61`. The capture path is not the problem; what the challenge itself did
+  is still being determined, and `streams` was added to answer it. Not solved, and
+  not claimed to be.
+- **Only a Chinese speech recogniser is installed here**
+  (`MS-2052-80-DESK`), and adding an English one needs administrator rights, so the
+  English audio challenge cannot be transcribed locally on this machine.
+  `ghost __speech` says so plainly rather than guessing.
+
 ## [0.6.0] - 2026-10-07
 
 ### Added

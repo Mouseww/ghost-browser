@@ -5,8 +5,10 @@
 #include <cmath>
 #include <cstdio>
 #include <string>
+#include <thread>
 #include <vector>
 
+#include "audio_capture.h"
 #include "captcha.h"
 #include "capture.h"
 #include "chrome.h"
@@ -15,6 +17,7 @@
 #include "json.h"
 #include "launch.h"
 #include "pipe.h"
+#include "speech.h"
 #include "uia.h"
 #include "window.h"
 
@@ -333,6 +336,50 @@ bool read_captcha(Session& session, CaptchaInfo* out, std::string* error) {
   return true;
 }
 
+// Click whatever the tree says is at `index`. The index is only valid for the
+// most recent tree, so every caller re-reads before asking.
+bool click_node(Session& session, int index, std::string* error) {
+  for (const Element& element : session.last_tree) {
+    if (element.index != index) continue;
+    int x = 0;
+    int y = 0;
+    if (!element_center(element, &x, &y)) {
+      *error = "the control has no visible area";
+      return false;
+    }
+    click_at(x, y, "left", 1);
+    return true;
+  }
+  *error = "the control is no longer on the page";
+  return false;
+}
+
+// Who is holding a stream on the render endpoint, if anyone.
+//
+// A silent capture is ambiguous: the page may have played nothing, or nothing may
+// have opened a stream at all. Windows already knows which -- it is the same list
+// the volume mixer draws -- so the answer belongs in the report instead of in the
+// next debugging session.
+std::string stream_summary() {
+  std::string error;
+  const std::vector<AudioSession> sessions = list_audio_sessions(&error);
+  if (sessions.empty()) {
+    return error.empty() ? std::string("nothing held a stream") : error;
+  }
+  std::string out;
+  for (const AudioSession& session : sessions) {
+    if (session.system_sounds) continue;
+    if (!out.empty()) out += "; ";
+    char line[160];
+    std::snprintf(line, sizeof(line), "pid %lu %s peak %.4f",
+                  static_cast<unsigned long>(session.pid),
+                  session.state == 1 ? "active" : "inactive",
+                  static_cast<double>(session.peak));
+    out += line;
+  }
+  return out.empty() ? std::string("only system sounds held a stream") : out;
+}
+
 Json cmd_captcha(Session& session, const Json& request) {
   std::string error;
   if (!refresh(session, &error)) return failure(error);
@@ -404,6 +451,131 @@ Json cmd_captcha(Session& session, const Json& request) {
       }
       if (latest.state != CaptchaState::kCheckbox) break;
     }
+  }
+
+  // The audio tier: answer a spoken challenge with what the sound card heard.
+  //
+  // Nothing below reads the audio URL or reaches into the page. The samples come
+  // off the render endpoint, which is where the browser put them, and the only
+  // thing that goes back into the page is a typed answer -- so this runs under
+  // exactly the same zero-CDP rule as the click does.
+  if (action == "solve-audio") {
+    if (!activate_window(session.window, &error)) return failure(error);
+
+    // An image challenge is one click away from its audio sibling.
+    if (latest.state == CaptchaState::kVisual && latest.audio_button_index >= 0) {
+      std::string click_error;
+      if (!click_node(session, latest.audio_button_index, &click_error)) {
+        return failure(click_error);
+      }
+      clicked = true;
+      const ULONGLONG asked = GetTickCount64();
+      while (GetTickCount64() - asked < 10000) {
+        Sleep(300);
+        if (!read_captcha(session, &latest, &error)) return failure(error);
+        if (latest.state == CaptchaState::kAudio) break;
+      }
+    }
+
+    out.set("clicked", Json::boolean(clicked));
+    out.set("state", Json::string(captcha_state_name(latest.state)));
+    out.set("detail", Json::string(latest.detail));
+    if (latest.state != CaptchaState::kAudio || latest.answer_field_index < 0) {
+      out.set("solved", Json::boolean(false));
+      out.set("detail", Json::string(
+                            "there is no open audio challenge to answer: " +
+                            std::string(captcha_state_name(latest.state))));
+      return out;
+    }
+
+    double seconds = arg_number(request, "seconds", 10.0);
+    if (seconds < 2.0) seconds = 2.0;
+    if (seconds > 30.0) seconds = 30.0;
+
+    char temp[MAX_PATH] = {0};
+    std::string dir = ".";
+    if (::GetTempPathA(MAX_PATH, temp) != 0) dir = temp;
+    char name[64];
+    std::snprintf(name, sizeof(name), "ghost-challenge-%lu.wav",
+                  static_cast<unsigned long>(::GetCurrentProcessId()));
+    const std::string wav_path = dir + name;
+
+    // The clip plays once as the challenge opens, so the recorder has to be
+    // running before a replay is asked for. Asking for one is what makes the
+    // start of the audio land inside the capture window rather than before it.
+    CaptureResult captured;
+    std::thread recorder([&captured, seconds, &wav_path]() {
+      captured = capture_loopback(seconds, std::string(), wav_path);
+    });
+    Sleep(300);
+    if (latest.refresh_button_index >= 0) {
+      std::string click_error;
+      click_node(session, latest.refresh_button_index, &click_error);
+    }
+    recorder.join();
+
+    out.set("device", Json::string(captured.device_name));
+    out.set("captured_seconds", Json::number(captured.seconds));
+    out.set("peak", Json::number(captured.peak));
+    out.set("rms", Json::number(captured.rms));
+    // Whether a stream existed at all, which the samples alone cannot say.
+    const std::string streams = stream_summary();
+    out.set("streams", Json::string(streams));
+    if (!captured.ok) {
+      out.set("solved", Json::boolean(false));
+      out.set("detail", Json::string(captured.error));
+      return out;
+    }
+    if (captured.peak <= 0.0) {
+      out.set("solved", Json::boolean(false));
+      out.set("detail", Json::string("the challenge played nothing: " +
+                                     captured.device_name + " stayed silent (" +
+                                     streams + ")"));
+      return out;
+    }
+
+    const std::string language = arg_string(request, "language");
+    const Transcript transcript = recognize_wav(wav_path, language, true);
+    ::DeleteFileA(wav_path.c_str());
+    if (!transcript.text.empty()) out.set("transcript", Json::string(transcript.text));
+    if (!transcript.digits.empty()) out.set("heard", Json::string(transcript.digits));
+    out.set("confidence", Json::number(transcript.confidence));
+    if (!transcript.ok) {
+      out.set("solved", Json::boolean(false));
+      out.set("detail", Json::string(transcript.error));
+      return out;
+    }
+    if (transcript.digits.empty()) {
+      out.set("solved", Json::boolean(false));
+      out.set("detail", Json::string(
+                            "the audio held nothing that sounded like digits"));
+      return out;
+    }
+
+    std::string click_error;
+    if (!click_node(session, latest.answer_field_index, &click_error)) {
+      return failure(click_error);
+    }
+    type_text(transcript.digits);
+    Sleep(200);
+    if (latest.verify_button_index >= 0) {
+      if (!click_node(session, latest.verify_button_index, &click_error)) {
+        return failure(click_error);
+      }
+    }
+
+    CaptchaInfo after = latest;
+    const ULONGLONG answered = GetTickCount64();
+    while (GetTickCount64() - answered < 8000) {
+      Sleep(400);
+      if (!read_captcha(session, &after, &error)) break;
+      if (after.state != CaptchaState::kAudio) break;
+    }
+    out.set("typed", Json::boolean(true));
+    out.set("state", Json::string(captcha_state_name(after.state)));
+    out.set("detail", Json::string(after.detail));
+    out.set("solved", Json::boolean(after.state == CaptchaState::kSolved));
+    return out;
   }
 
   // Then watch the rest of the way. The widget disappearing means it was answered;

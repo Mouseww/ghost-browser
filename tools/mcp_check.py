@@ -218,7 +218,12 @@ def main() -> int:
                     all("inputSchema" in tool for tool in tools))
 
         # --- a real browser, driven through MCP ---------------------------
-        result = client.call_tool("ghost_open", {}, timeout=args.timeout)
+        # Starting *at* the URL costs no synthesized input, so every check below that
+        # only reads the page works even in a session with no foreground window. The
+        # address-bar navigation is the one step that needs one, and it is graded as
+        # unmeasurable there instead of taking the read-only checks down with it.
+        result = client.call_tool("ghost_open", {"url": "https://example.com"},
+                                  timeout=args.timeout)
         checks.true("ghost_open starts the browser", not result.get("isError"),
                     text_of(result))
         print("       " + text_of(result).replace("\n", "\n       "))
@@ -228,8 +233,40 @@ def main() -> int:
         checks.contains("ghost_status reports a pid", status_text, "pid:")
         checks.true("ghost_status is not an error", not result.get("isError"), status_text)
 
-        # The example.com page is reachable from this machine; the navigation is a
-        # real Ctrl+L + type + Enter, so it needs a foreground-capable session.
+        result = client.call_tool("ghost_page", {"max_nodes": 400})
+        page_text = text_of(result)
+        checks.true("ghost_page returns elements", "elements" in page_text, page_text[:200])
+        # The document node carries id=RootWebArea, which no browser-chrome element
+        # ever has. An earlier version of this check matched the string "Example
+        # Domain" and passed on the *window title* while the page itself was invisible,
+        # which is exactly the failure it was supposed to catch.
+        checks.contains("ghost_page reaches the document", page_text, "id=RootWebArea")
+
+        result = client.call_tool("ghost_find", {"role": "link"})
+        find_text = text_of(result)
+        head = (find_text.splitlines() or [""])[0].split()
+        link_count = int(head[0]) if head and head[0].isdigit() else -1
+        checks.true("ghost_find sees page links", link_count > 0, find_text[:300])
+
+        # example.com carries no human-verification widget, so the honest answer is
+        # "none" — not an error, and not a provider invented out of the page's own URL,
+        # which is the bug ARCHITECTURE.md §14.3 records.
+        result = client.call_tool("ghost_captcha", {"action": "detect"})
+        captcha_text = text_of(result)
+        checks.true("ghost_captcha runs", not result.get("isError"), captcha_text)
+        checks.contains("ghost_captcha finds no challenge on a plain page",
+                        captcha_text, "no human-verification challenge")
+
+        # The audio route has to refuse for the same reason, and refuse before it
+        # touches the audio device: a page with no challenge must not open a recording
+        # just because it was asked to.
+        result = client.call_tool("ghost_captcha", {"action": "solve-audio", "seconds": 2})
+        audio_text = text_of(result)
+        checks.true("ghost_captcha solve-audio runs", not result.get("isError"), audio_text)
+        checks.contains("ghost_captcha solve-audio refuses a plain page",
+                        audio_text, "no human-verification challenge")
+
+        # Navigation drives the real address bar, so it needs a foreground window.
         result = client.call_tool("ghost_navigate", {"url": "https://example.com"},
                                   timeout=args.timeout)
         navigate_text = text_of(result)
@@ -239,30 +276,6 @@ def main() -> int:
         else:
             checks.contains("ghost_navigate reports the page title",
                             navigate_text, "Example Domain")
-
-            result = client.call_tool("ghost_page", {"max_nodes": 400})
-            page_text = text_of(result)
-            checks.true("ghost_page returns elements", "elements" in page_text, page_text[:200])
-            # The document node carries id=RootWebArea, which no browser-chrome
-            # element ever has. An earlier version of this check matched the string
-            # "Example Domain" and passed on the *window title* while the page itself
-            # was invisible, which is exactly the failure it was supposed to catch.
-            checks.contains("ghost_page reaches the document", page_text, "id=RootWebArea")
-
-            result = client.call_tool("ghost_find", {"role": "link"})
-            find_text = text_of(result)
-            head = (find_text.splitlines() or [""])[0].split()
-            link_count = int(head[0]) if head and head[0].isdigit() else -1
-            checks.true("ghost_find sees page links", link_count > 0, find_text[:300])
-
-            # example.com carries no human-verification widget, so the honest answer
-            # is "none" — not an error, and not a provider invented out of the page's
-            # own URL, which is the bug ARCHITECTURE.md §14.3 records.
-            result = client.call_tool("ghost_captcha", {"action": "detect"})
-            captcha_text = text_of(result)
-            checks.true("ghost_captcha runs", not result.get("isError"), captcha_text)
-            checks.contains("ghost_captcha finds no challenge on a plain page",
-                            captcha_text, "no human-verification challenge")
 
         # Screenshots work in any session, foreground or not.
         result = client.call_tool("ghost_screenshot")
