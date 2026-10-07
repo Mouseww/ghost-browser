@@ -611,9 +611,14 @@ From an agent the same thing is one MCP call — `ghost_captcha`, with
 
 This is a vertical slice, not a finished product. Not built yet:
 
-- **Image challenges are not solved.** Reading the challenge and clicking the
-  checkbox works, and audio challenges are recorded, transcribed and answered (§9),
-  but a picture grid is not classified.
+- **Image challenges are not solved, for an architectural reason rather than an
+  unfinished one.** A solving service can classify a picture grid, but reCAPTCHA-style
+  flows end with the service handing back a token that the *page* writes into a hidden
+  `g-recaptcha-response` field — and that step needs DOM access. The only channel this
+  browser has into a page is the accessibility tree, and hidden controls are not in it,
+  so the token would be obtainable but undeliverable. The audio route works precisely
+  because its answer is ordinary typing. Reading the challenge and clicking the checkbox
+  works, and audio challenges are recorded, transcribed and answered (§9).
 - **hCaptcha's audio route is not driven, and that is a measured dead end rather than
   an oversight.** The challenge frame does expose a button named `About hCaptcha &
   Accessibility Options` (with no automation id), and hCaptcha's own image alt text
