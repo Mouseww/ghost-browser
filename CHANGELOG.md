@@ -5,6 +5,82 @@ All notable changes to this project are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-10-07
+
+### Added
+
+- **The browser now works in sessions that cannot deliver input.** A disconnected
+  RDP session, a service, or anything headless has no foreground window, and Windows
+  silently discards synthesized input there — `ghost` used to fail outright. `click`,
+  `type` and `captcha` now fall back to the UI Automation invoke and value patterns,
+  which reach the page through the accessibility tree instead of the input queue, so
+  they work with no foreground window at all. **The fallback is reported, not hidden**:
+  every click and type returns `input`, which is `synthesized` when a real `SendInput`
+  carried it and `accessibility` when it went through UI Automation. The two are not
+  equivalent — a page sees trusted events from the first and `event.isTrusted: false`
+  from the second — so a caller can tell which one answered its challenge. Only a
+  plain named left-click falls back; right-clicks and double-clicks have no
+  accessibility equivalent and are refused rather than silently downgraded.
+  Measured: in a session where `GetForegroundWindow()` returns 0 and a full
+  `AttachThreadInput`/`SetForegroundWindow` sequence still fails, clicking a link by
+  index navigates the page and reports `input: accessibility`.
+- **Third tier: when the machine has no recogniser for the challenge's language, the
+  recording goes to a solving service instead.** The audio route records what the
+  machine actually played; the local Windows recogniser is tried first, and only if
+  it returns nothing *and* a key is configured does the same recording go to a
+  2captcha-compatible endpoint. There is no built-in key and there never will be:
+  with none configured the third tier is off, not broken. `GHOST_CAPTCHA_KEY` or
+  `captcha_api_key` in the profile supplies the key, `GHOST_CAPTCHA_URL` overrides
+  the service. The upload is down-mixed and resampled to 16 kHz mono 16-bit — about
+  157 KB for a five-second challenge — and the response says `solved_by: api` rather
+  than leaving you to guess where the digits came from. Acceptance
+  (`tools/solve_api_check.py`) points `GHOST_CAPTCHA_URL` at a stand-in service on
+  localhost, so the protocol and the pipeline are verified without spending money or
+  depending on anyone's answer quality: **12 checks, 0 failed** when reCAPTCHA serves
+  the audio challenge. It is rate-limited too — after enough attempts from one address
+  reCAPTCHA stops offering the audio route, and then stops serving the widget at all —
+  so the script reports that as *not measurable* rather than as a failure, because
+  blaming this tier for the challenge refusing would be as dishonest as claiming a run
+  that never happened.
+- **`solve-audio` presses the challenge's own play control**, and reports it as
+  `play`. **The audio challenge does not start itself**, and until its play button is
+  pressed the page holds an open stream that renders nothing — which looks exactly
+  like a page that played nothing. That was the whole of the previously unexplained
+  `peak 0`: not a broken capture, but a challenge waiting for a person. The control
+  is found structurally rather than by its label, because the label is a localized
+  sentence; after the fix the same capture went from `peak 0` to `peak 0.1767`, and a
+  kept recording measured `44100 Hz 2ch 16-bit 7.98 s` with 7 seconds of sound.
+- `solve-audio` takes `keep`, which returns the recording's path as `wav` instead of
+  deleting it, because a failed transcription cannot be diagnosed from `peak`, `rms`
+  and `confidence` alone.
+- `ghost __audio sessions` lists the OS audio sessions — process id, state, whether
+  it is the system-sounds session, peak level and identifier. This is the same data
+  the Windows volume mixer draws, and it is what distinguishes "the page never played
+  anything" from "nothing ever opened a stream", which samples alone cannot.
+
+### Fixed
+
+- **`find` and `tree` disagreed about what an element's index was.** `find` numbered
+  elements after filtering and `tree` numbered them before, so
+  `find(role="link")[0]["index"]` returned 0 and `click(index=0)` clicked the first
+  element of the whole tree. Indices are now assigned to every element the walk
+  stores, and filtering only decides what is reported, not where anything is.
+- **A success branch that only updated the fields it wrote left the rest of the
+  verdict stale.** When the solving service returned digits, the code overwrote
+  `digits` but left `ok` false, so the later early-return fired and the service's
+  answer was never typed into the page — visible as `heard` populated while `typed`
+  was `None`. A branch that succeeds has to update the whole verdict, not just its
+  own fields.
+
+### Changed
+
+- `captcha` reports `input` for the click that carried it, so a solved challenge is
+  no longer treated as evidence that a trusted click answered it.
+- The captcha acceptance scripts retry by **restarting the browser** rather than
+  re-clicking, because a half-clicked widget keeps its state and clicking a checkbox
+  that is already answered is itself a failure. `tools/captcha_check.py` runs
+  **21 checks, 0 failed, 0 not measurable** — including with no foreground window.
+
 ## [0.7.0] - 2026-10-07
 
 ### Added

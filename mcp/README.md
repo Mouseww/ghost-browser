@@ -79,7 +79,7 @@ but `ghost serve` does not exist there yet.
 | `ghost_type` | `text` | Type into the focused field |
 | `ghost_key` | `key` \| `keys[]` | Press a key or a combination |
 | `ghost_scroll` | `delta?`, `css_x?`, `css_y?` | Scroll |
-| `ghost_captcha` | `action?` (`detect`/`solve`), `timeout?` | Read and click a human-verification challenge |
+| `ghost_captcha` | `action?` (`detect`/`solve`/`solve-audio`), `timeout?`, `seconds?`, `language?`, `keep?` | Read, click, or record-and-answer a human-verification challenge |
 | `ghost_screenshot` | — | Capture the window as PNG |
 | `ghost_close` | — | Close the browser and stop the server |
 
@@ -92,8 +92,21 @@ hunting for the checkbox yourself. It reads the challenge from the accessibility
 and returns the provider, the state and the sitekey; with `action="solve"` it clicks
 the checkbox and reports where that got you. Cloudflare Turnstile usually passes from
 that click alone. hCaptcha and reCAPTCHA escalate to an image or audio challenge,
-which the tool reports honestly rather than pretending to have solved — the audio
-route is the one that can be automated, and that is the next piece of work.
+which the tool reports honestly rather than pretending to have solved.
+
+The audio challenge is the automatable one: `action="solve-audio"` records what the
+machine actually played, transcribes the digits and types them back, and says whether
+the answer came from this machine (`solved_by: local`) or from a solving service
+(`api`). Pass `language` — speech recognisers are installed per language and the
+machine may not have one for the challenge's. A solving service is used only when the
+local recogniser comes back empty **and** `GHOST_CAPTCHA_KEY` (or `captcha_api_key` in
+the profile) is set; with no key the service tier is simply off. `keep=true` returns
+the recording's path, which is what you want when the transcription fails.
+
+Every click reports `input`: `synthesized` when a real `SendInput` carried it,
+`accessibility` when it went through UI Automation instead. The second happens when
+the session has no foreground window — a disconnected RDP session, a service, anything
+headless — and it is why these tools keep working there at all.
 
 ## Environment
 

@@ -511,6 +511,77 @@ bool write_wav(const std::string& path, const CaptureResult& capture, std::strin
   return true;
 }
 
+bool write_speech_wav(const std::string& path, const CaptureResult& capture,
+                      uint32_t target_rate, std::string* error) {
+  if (capture.channels == 0 || capture.sample_rate == 0) {
+    if (error != nullptr) *error = "nothing to write: the capture has no format";
+    return false;
+  }
+  if (target_rate == 0) target_rate = 16000;
+  const SampleKind kind = capture.is_float ? SampleKind::kFloat32
+                                           : (capture.bits_per_sample == 16
+                                                  ? SampleKind::kInt16
+                                                  : SampleKind::kInt32);
+  const size_t sample_bytes = bytes_per_sample(kind);
+  if (sample_bytes == 0) {
+    if (error != nullptr) *error = "nothing to write: unknown sample format";
+    return false;
+  }
+
+  const size_t total = capture.pcm.size() / sample_bytes;
+  const size_t frames = total / capture.channels;
+  const double step = static_cast<double>(capture.sample_rate) / target_rate;
+  const size_t out_frames =
+      step <= 0.0 ? 0 : static_cast<size_t>(static_cast<double>(frames) / step);
+
+  // Down-mix and resample in one pass. Speech recognition does not need the render
+  // endpoint's 44.1 kHz stereo, and a solving service refuses a body over about a
+  // megabyte -- at 44.1 kHz stereo that ceiling arrives after seven seconds, which is
+  // shorter than the challenge. 16 kHz mono is the format the services expect anyway.
+  std::string data;
+  data.reserve(out_frames * 2);
+  for (size_t i = 0; i < out_frames; ++i) {
+    const double pos = static_cast<double>(i) * step;
+    const size_t left = static_cast<size_t>(pos);
+    const size_t right = left + 1 < frames ? left + 1 : left;
+    const double frac = pos - static_cast<double>(left);
+    double mixed = 0.0;
+    for (size_t c = 0; c < capture.channels; ++c) {
+      const double a = sample_at(capture.pcm.data(), left * capture.channels + c, kind);
+      const double b = sample_at(capture.pcm.data(), right * capture.channels + c, kind);
+      mixed += a + (b - a) * frac;
+    }
+    mixed /= static_cast<double>(capture.channels);
+    const double scaled = mixed * 32767.0;
+    put_u16(data, static_cast<uint16_t>(static_cast<int16_t>(
+                      std::max(-32768.0, std::min(32767.0, scaled)))));
+  }
+
+  const uint32_t data_bytes = static_cast<uint32_t>(data.size());
+  std::string out;
+  out.reserve(44 + data_bytes);
+  out.append("RIFF", 4);
+  put_u32(out, 36 + data_bytes);
+  out.append("WAVE", 4);
+  out.append("fmt ", 4);
+  put_u32(out, 16);
+  put_u16(out, 1);  // PCM
+  put_u16(out, 1);  // mono
+  put_u32(out, target_rate);
+  put_u32(out, target_rate * 2);
+  put_u16(out, 2);
+  put_u16(out, 16);
+  out.append("data", 4);
+  put_u32(out, data_bytes);
+  out.append(data);
+
+  if (!write_file(path, out)) {
+    if (error != nullptr) *error = "could not write " + path;
+    return false;
+  }
+  return true;
+}
+
 std::string describe_capture(const CaptureResult& capture) {
   char buf[256];
   std::snprintf(buf, sizeof(buf), "%s  %u Hz  %uch  %u-bit  %.2fs",

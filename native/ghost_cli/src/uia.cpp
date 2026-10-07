@@ -22,6 +22,11 @@ class Com {
   ~Com() { reset(); }
   Com(const Com&) = delete;
   Com& operator=(const Com&) = delete;
+  Com(Com&& other) noexcept : ptr_(other.release()) {}
+  Com& operator=(Com&& other) noexcept {
+    if (this != &other) reset(other.release());
+    return *this;
+  }
 
   T** put() {
     reset();
@@ -218,6 +223,17 @@ struct Walk {
   bool keep_anonymous = true;
   std::string role;
   std::string name_contains;
+  // When set, the walk stops on the element that would have been stored at this
+  // index and hands back the live COM element instead. Indices are assigned by
+  // exactly the same rule as an ordinary dump, so an index from dump_tree always
+  // addresses the same control here.
+  int target_index = -1;
+  IUIAutomationElement* found = nullptr;  // AddRef'd
+  bool stop = false;
+  // How many elements this walk has stored so far, counted before the caller's
+  // role/name filter. An index has to mean the same thing to find, tree and
+  // click, or a caller that finds a control cannot act on it.
+  int seen = 0;
 };
 
 bool wanted(const Element& element, const Walk& walk) {
@@ -230,15 +246,25 @@ bool wanted(const Element& element, const Walk& walk) {
 }
 
 void visit(IUIAutomationElement* node, int depth, Walk& walk) {
-  if (static_cast<int>(walk.out->size()) >= walk.max_nodes) return;
+  if (walk.stop) return;
+  if (walk.seen >= walk.max_nodes) return;
 
   const Element element = describe(node);
   const bool interesting = !element.name.empty() || !element.value.empty();
   if (interesting || walk.keep_anonymous) {
+    // The index counts every element the walk would store, matching or not: the
+    // filter decides what is reported, never what a position means.
+    const int index = walk.seen++;
+    if (index == walk.target_index) {
+      node->AddRef();
+      walk.found = node;
+      walk.stop = true;
+      return;
+    }
     if (wanted(element, walk)) {
       Element stored = element;
       stored.depth = depth;
-      stored.index = static_cast<int>(walk.out->size());
+      stored.index = index;
       walk.out->push_back(stored);
     }
   }
@@ -249,7 +275,8 @@ void visit(IUIAutomationElement* node, int depth, Walk& walk) {
   walk.walker->GetFirstChildElement(node, child.put());
   while (child) {
     visit(child.get(), depth + 1, walk);
-    if (static_cast<int>(walk.out->size()) >= walk.max_nodes) return;
+    if (walk.stop) return;
+    if (walk.seen >= walk.max_nodes) return;
     Com<IUIAutomationElement> next;
     walk.walker->GetNextSiblingElement(child.get(), next.put());
     child.reset(next.release());
@@ -315,6 +342,71 @@ std::vector<Element> walk_window(HWND window, int max_depth, int max_nodes,
   return out;
 }
 
+// The live COM element that dump_tree would have numbered `index`. The walk
+// parameters are the control plane's own, because an index is only meaningful
+// against the walk that produced it.
+Com<IUIAutomationElement> element_at(HWND window, int index, std::string* error) {
+  Com<IUIAutomationElement> none;
+  if (window == nullptr || !IsWindow(window)) {
+    *error = "no such window";
+    return none;
+  }
+  ensure_com();
+
+  Com<IUIAutomation> automation;
+  if (FAILED(CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER,
+                              IID_PPV_ARGS(automation.put())))) {
+    *error = "UI Automation is unavailable (CoCreateInstance failed)";
+    return none;
+  }
+
+  Com<IUIAutomationElement> root;
+  if (FAILED(automation->ElementFromHandle(window, root.put())) || !root) {
+    *error = "UI Automation could not attach to the window";
+    return none;
+  }
+
+  Com<IUIAutomationTreeWalker> walker;
+  if (FAILED(automation->get_ControlViewWalker(walker.put())) || !walker) {
+    *error = "UI Automation has no tree walker";
+    return none;
+  }
+
+  std::vector<Element> scratch;
+  Walk state;
+  state.walker = walker.get();
+  state.out = &scratch;
+  state.max_depth = kTreeDepth;
+  state.max_nodes = kTreeNodes;
+  state.keep_anonymous = false;
+  state.target_index = index;
+
+  Com<IUIAutomationElement> child;
+  walker->GetFirstChildElement(root.get(), child.put());
+  while (child && !state.stop) {
+    visit(child.get(), 1, state);
+    if (state.stop) break;
+    Com<IUIAutomationElement> next;
+    walker->GetNextSiblingElement(child.get(), next.put());
+    child.reset(next.release());
+  }
+
+  if (state.found == nullptr) {
+    *error = "the control is no longer on the page";
+    return none;
+  }
+  Com<IUIAutomationElement> found;
+  found.reset(state.found);
+  return found;
+}
+
+// The first pattern the control actually offers. Each is a capability the
+// control advertises about itself, so asking is not a guess.
+template <typename T>
+bool pattern(IUIAutomationElement* element, PATTERNID id, Com<T>* out) {
+  return SUCCEEDED(element->GetCurrentPatternAs(id, IID_PPV_ARGS(out->put()))) && *out;
+}
+
 }  // namespace
 
 std::vector<Element> dump_tree(HWND window, int max_depth, int max_nodes,
@@ -359,6 +451,83 @@ bool element_center(const Element& element, int* x, int* y) {
   // The middle of the control: the one point every widget treats as a hit.
   *x = element.bounds.left + width / 2;
   *y = element.bounds.top + height / 2;
+  return true;
+}
+
+bool invoke_element(HWND window, int index, std::string* error) {
+  std::string local;
+  if (error == nullptr) error = &local;
+  error->clear();
+
+  Com<IUIAutomationElement> element = element_at(window, index, error);
+  if (!element) return false;
+
+  // Invoke first: it is what a button and a link advertise, and what a checkbox
+  // that wants clicking exposes. Toggle and Select cover the checkboxes that
+  // advertise those instead, and the legacy default action catches anything that
+  // only speaks the older interface.
+  Com<IUIAutomationInvokePattern> invoke;
+  if (pattern(element.get(), UIA_InvokePatternId, &invoke)) {
+    if (SUCCEEDED(invoke->Invoke())) return true;
+    *error = "the control refused to be invoked";
+    return false;
+  }
+
+  Com<IUIAutomationTogglePattern> toggle;
+  if (pattern(element.get(), UIA_TogglePatternId, &toggle)) {
+    if (SUCCEEDED(toggle->Toggle())) return true;
+    *error = "the control refused to be toggled";
+    return false;
+  }
+
+  Com<IUIAutomationSelectionItemPattern> select;
+  if (pattern(element.get(), UIA_SelectionItemPatternId, &select)) {
+    if (SUCCEEDED(select->Select())) return true;
+    *error = "the control refused to be selected";
+    return false;
+  }
+
+  Com<IUIAutomationLegacyIAccessiblePattern> legacy;
+  if (pattern(element.get(), UIA_LegacyIAccessiblePatternId, &legacy)) {
+    if (SUCCEEDED(legacy->DoDefaultAction())) return true;
+    *error = "the control has no default action";
+    return false;
+  }
+
+  *error = "the control exposes no way to be activated";
+  return false;
+}
+
+bool set_element_value(HWND window, int index, const std::string& text,
+                       std::string* error) {
+  std::string local;
+  if (error == nullptr) error = &local;
+  error->clear();
+
+  Com<IUIAutomationElement> element = element_at(window, index, error);
+  if (!element) return false;
+
+  Com<IUIAutomationValuePattern> value;
+  if (!pattern(element.get(), UIA_ValuePatternId, &value)) {
+    *error = "the field does not accept a value";
+    return false;
+  }
+  BOOL read_only = FALSE;
+  if (SUCCEEDED(value->get_CurrentIsReadOnly(&read_only)) && read_only != FALSE) {
+    *error = "the field is read-only";
+    return false;
+  }
+
+  const std::wstring wide = widen(text);
+  const HRESULT hr = value->SetValue(const_cast<wchar_t*>(wide.c_str()));
+  if (FAILED(hr)) {
+    char message[128];
+    std::snprintf(message, sizeof(message),
+                  "the field refused the value (0x%08lX)",
+                  static_cast<unsigned long>(hr));
+    *error = message;
+    return false;
+  }
   return true;
 }
 

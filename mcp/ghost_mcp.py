@@ -45,7 +45,7 @@ PROTOCOL_VERSION = "2025-06-18"
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 
 SERVER_NAME = "ghost"
-SERVER_VERSION = "0.7.0"
+SERVER_VERSION = "0.8.0"
 
 DEFAULT_ID = os.environ.get("GHOST_ID") or "mcp"
 READY_TIMEOUT = float(os.environ.get("GHOST_TIMEOUT") or 60)
@@ -494,7 +494,12 @@ TOOLS = [
             "hCaptcha and reCAPTCHA escalate to an image or audio challenge that a "
             "person still has to solve. With action='solve-audio' it opens the audio "
             "challenge, records what the machine actually plays through the OS audio "
-            "stack, transcribes the digits locally and types them back."
+            "stack, transcribes the digits and types them back. It reports "
+            "solved_by='local' or 'api': the local Windows recogniser is used first, "
+            "and a solving service only when the machine has no recogniser for the "
+            "challenge's language and GHOST_CAPTCHA_KEY (or the profile's "
+            "captcha_api_key) is set. Reads 'peak' and 'play' to tell a silent page "
+            "from a recording that failed, and never retries in a loop."
         ),
         "inputSchema": {
             "type": "object",
@@ -507,6 +512,9 @@ TOOLS = [
                             "description": "seconds of audio to record for solve-audio"},
                 "language": {"type": "string",
                              "description": "speech recogniser culture, e.g. en-US"},
+                "keep": {"type": "boolean", "default": False,
+                         "description": "keep the solve-audio recording and return its "
+                                        "path as 'wav', instead of deleting it"},
             },
             "additionalProperties": False,
         },
@@ -661,6 +669,8 @@ def run_tool(session: Session, name: str, args: dict) -> dict:
             params["seconds"] = int(args.get("seconds", 10))
             if args.get("language"):
                 params["language"] = args["language"]
+            if args.get("keep"):
+                params["keep"] = True
         response = session.call("captcha", **params)
         provider = response.get("provider", "none")
         state = response.get("state", "?")
@@ -677,9 +687,12 @@ def run_tool(session: Session, name: str, args: dict) -> dict:
         if action == "solve":
             lines.append(f"clicked:  {bool(response.get('clicked'))}")
         if action == "solve-audio":
-            # The level and the stream list are what separate "the challenge
-            # played nothing" from "nothing ever opened a stream", and they are
-            # the first thing worth knowing when the answer comes back empty.
+            # `play` and `peak` together are what separate "the challenge never
+            # played anything" from "nothing ever opened a stream" -- and the audio
+            # challenge does not start itself, so an unpressed play control is the
+            # first thing worth knowing when the answer comes back empty.
+            if response.get("play"):
+                lines.append(f"play:     {response['play']}")
             if response.get("device"):
                 lines.append(f"device:   {response['device']}")
             if response.get("captured_seconds") is not None:
@@ -688,12 +701,18 @@ def run_tool(session: Session, name: str, args: dict) -> dict:
                 lines.append(f"peak:     {response['peak']}")
             if response.get("streams"):
                 lines.append(f"streams:  {response['streams']}")
+            if response.get("solved_by"):
+                lines.append(f"by:       {response['solved_by']}")
             if response.get("heard"):
                 lines.append(f"heard:    {response['heard']}")
             if response.get("confidence") is not None:
                 lines.append(f"conf:     {response['confidence']}")
             if response.get("typed"):
                 lines.append(f"typed:    {response['typed']}")
+            if response.get("input"):
+                lines.append(f"input:    {response['input']}")
+            if response.get("wav"):
+                lines.append(f"wav:      {response['wav']}")
 
         if state == "solved":
             lines.append("the challenge is answered")
@@ -701,9 +720,14 @@ def run_tool(session: Session, name: str, args: dict) -> dict:
             lines.append("an image challenge is open; a person still has to solve it")
         elif state == "audio":
             if action == "solve-audio":
-                lines.append("the audio challenge was recorded and transcribed"
-                             if response.get("heard")
-                             else "an audio challenge is open, but nothing usable was heard")
+                if response.get("heard"):
+                    lines.append("the audio challenge was recorded and transcribed")
+                elif response.get("streams") == "nothing held a stream":
+                    lines.append("an audio challenge is open, but the page never played "
+                                 "anything -- retrying will not help")
+                else:
+                    lines.append("an audio challenge is open, but nothing usable was "
+                                 "heard; check 'play' and 'peak' before retrying")
             else:
                 lines.append("an audio challenge is open — use action='solve-audio' to "
                              "record it and answer it automatically")

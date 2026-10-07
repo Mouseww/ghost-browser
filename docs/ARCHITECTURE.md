@@ -718,16 +718,66 @@ mask 恢复默认后 `19 checks, 0 failed`。**证明移除它们的就是字体
 ——而「页面没播」和「根本没开流」在样本里长得一模一样。音频会话表就是为区分这两者加的，它
 显示的就是 Windows 音量合成器画的那份数据。
 
-**本机的两个诚实限制：**
+**结论：音频挑战不自播。** reCAPTCHA 的音频帧里有它自己的播放控件，在按下之前音频元素只持有一个
+开着却不渲染任何样本的会话——所以 `active peak 0.0000` 与「页面没播」是同一个现象，先前那些
+`peak 0` 的采集并不是采集失败，而是**挑战在等人按下播放**。这个控件不能靠文本找：它的标签是本地化
+句子（本机是「按“播放”可听语音内容」，英文是 “Press PLAY to listen”）。它靠结构找——在含 `bframe`
+的挑战帧子树里，第一个 automation id **不以 `recaptcha-` 开头**的按钮就是它，因为 reCAPTCHA 自己
+的控件（reload / image / liveness / help / verify）都带 `recaptcha-` 前缀且跨语言稳定，这也是本文件
+其余控件一律按 id 匹配的同一个理由（`native\ghost_cli\src\captcha.cpp`）。补上这一次点击后，同一台
+机器、同一个会话的采集立刻从 `peak 0` 变成 `peak 0.1767`；用 `keep` 参数留下的录音是
+`44100 Hz 2ch 16-bit 7.98 s`、整段 `peak 0.405060`，逐秒电平里有 **7 秒有声**。
 
-- **reCAPTCHA 音频挑战在每一次到达 `state=audio` 的运行里都采到 `peak 0`。** 采集链路已被上面
-  第 1、2 条证明正常，所以问题在「那次挑战到底有没有播」。为此 `solve-audio` 的回报里加了
-  `streams` 字段（当时是谁持有流、active 还是 inactive、电平多少），但**当前这个 RDP 会话没有
-  前台窗口**（`GetForegroundWindow()` 返回 0），Windows 会静默丢弃合成输入，点击无法进行，
-  这个判定还没跑完。**这一条是未结案的，不是已解决的。**
+**本机的一个诚实限制：**
+
 - **本机没有英文识别器。** `HKLM:\SOFTWARE\Microsoft\Speech\Recognizers\Tokens` 下只有
   `MS-2052-80-DESK`（zh-CN），`Speech_OneCore` 下只有 `MS-2052-110-WINMO-DNN`，安装英文识别器
-  需要管理员权限。因此英文的 reCAPTCHA 音频挑战在这台机器上**无法本地转写**；`ghost __speech`
-  对未知语言走诚实降级路径（`no recognizer for "en" is installed (installed: zh-CN)`），不会
-  假装听懂。
+  需要管理员权限（本机有 en-US *语音* `TTS_MS_EN-US_ZIRA_11.0`，却没有 en-US *识别器*——Windows
+  按语言特性装识别器，这两者并不绑定）。因此英文的 reCAPTCHA 音频挑战在这台机器上**无法本地
+  转写**；`ghost __speech` 对未知语言走诚实降级路径（`no recognizer for "en" is installed
+  (installed: zh-CN)`），不会假装听懂。这不是第二级的设计缺陷，而是它的边界，也正是第三级存在的
+  理由。
+
+**这一层可用的正对照。** 判断「环回→STT 这条路到底行不行」不能只看挑战：本机 TTS 合成中文数字
+`三八五一二四` 播进一个 `<audio autoplay loop>` 页面，环回采到 `44100 Hz 2ch 32-bit 4.99s`、
+`silent 0 frames`、`peak 0.955259`，`ghost __speech <wav> zh --digits` 转写出 `385124`、
+**置信度 0.9366**。**所以整条通路是通的，reCAPTCHA 的失败纯粹是缺英文识别器。**
+
+## 14.7 第三级：把采集到的音频交给第三方解题服务
+
+第二级只被语言卡住，所以第三级不是「另一条采集路线」，而是**同一份录音的另一个去向**：本地识别
+失败且配置了 key 时，把环回采到的音频交给 2captcha 一类的服务转写。
+
+上传的不是原始录音。渲染端点给的是 44.1 kHz 立体声，既超出语音识别所需，也大到不必上传，所以
+`write_speech_wav`（`native\ghost_cli\src\audio_capture.cpp`）一遍完成混单声道与线性重采样，写出
+16 kHz 单声道 16 位 PCM——实测一次 5 秒挑战的上传体是 **156,844 字节**。
+
+| 文件 | 职责 |
+|---|---|
+| `native\ghost_cli\src\solve_api.cpp` | WinHTTP 客户端：`POST /in.php`（`method=audio`，体是 url 编码后的 base64）拿任务号，再每 5 秒 `GET /res.php` 轮询，`CAPCHA_NOT_READY` 视为继续等，最长 120 秒 |
+| `native\ghost_cli\src\solve_api.h` | `resolve_solve_api`：URL 取 `GHOST_CAPTCHA_URL`（默认 `https://2captcha.com`），key 依次取 显式参数 → `GHOST_CAPTCHA_KEY` → profile 的 `captcha_api_key` |
+| `native\ghost_cli\src\daemon.cpp` | `solve-audio`：先本地识别，只有在它没拿到数字**且**配了 key 时才走服务，并在回应里如实标注 `solved_by` 是 `local` 还是 `api` |
+
+选 WinHTTP 而不是 WinINet，是因为进程可能处于受限令牌或模拟身份之下，而 WinINet 的按用户会话状态
+正是那种会静默失败的东西。**没有内置 key，也不会有**：未配置时 `provider` 为空，第三级是「关闭」
+而不是「坏掉」，`solve-audio` 就停在第二级的诚实拒绝上。
+
+实测（`tools\solve_api_check.py`，用一个绑在 `127.0.0.1:0` 的本地替身服务当对手）：**12 checks,
+0 failed**。替身服务收到的确实是 `method=audio`、带 key、带 `language=en`、`Content-Type:
+application/x-www-form-urlencoded` 的表单；base64 体解开后 RIFF 头是 `16000 Hz 1ch 16-bit`；
+第一次轮询拿到 `CAPCHA_NOT_READY` 后确实再轮了一次；最终 `solved_by='api'`、`heard='385124'`、
+`typed=True`。**这条验收不碰真钱、不碰真服务，验的是这一级的协议与管线，而不是某个服务商的答案
+质量。**
+
+**这条验收是会被限流的，而且它如实报告这一点。** 同一个地址反复索要音频挑战之后，reCAPTCHA
+先是停止提供音频路线，再往后连 widget 都不再下发（实测：连续四轮全部 `provider=none`、
+`state=absent`）。这时脚本把结果记为 **not measurable 而不是 failed**——把挑战的拒绝算成这一级的
+失败，和把一次没发生的运行算成通过一样不诚实。四轮之间的退避是刻意的：**拒绝是按频率形成的，
+猛敲它正是造成它的原因。**
+
+一个在验收里暴露出来的真 bug 值得记下来：API 分支覆盖了 `transcript.digits` 却忘了改
+`transcript.ok`，于是后面 `if (!transcript.ok)` 的提前返回照常触发，服务给的答案**从未被输入页面**
+（表现是 `heard` 有值而 `typed=None`）。**一个「成功」的分支必须把整份判定状态一起改掉，只改它自己
+写的那几个字段，等于没改。**
+
 

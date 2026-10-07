@@ -32,10 +32,12 @@ needed to work on the source or run the fingerprint test page under `harness/`.
 | WebGL vendor / renderer (`UNMASKED_*`) | **working** — via DXGI adapter identity |
 | Font enumeration (`document.fonts`, `measureText`) | **working** — DirectWrite collection filtered |
 | Zero-CDP control plane (`ghost serve`) | **working** — 19 checks |
-| Reading a human-verification challenge | **working** — 18 checks |
-| Clearing Cloudflare Turnstile | **working** — a trusted click answers it |
+| Working with no foreground window | **working** — falls back to UI Automation and says which channel it used |
+| Reading a human-verification challenge | **working** — 21 checks |
+| Clearing Cloudflare Turnstile | **working** — one click answers it |
 | hCaptcha / reCAPTCHA image challenges | **read and opened, not solved** |
-| hCaptcha / reCAPTCHA audio challenges | **reachable, solver not wired up** |
+| reCAPTCHA audio challenge | **recorded, transcribed and answered** — locally, or by a service when no recogniser fits |
+| hCaptcha audio challenge | **not driven** — it goes through hCaptcha's accessibility menu |
 | Window branding (title, icon, taskbar) | **working** |
 | Reading cookies while the browser runs | **impossible** — Chrome holds the file unshared |
 | Fingerprint coherence harness | **34 checks, 0 failed** |
@@ -234,19 +236,45 @@ ghost call '{"cmd":"captcha","action":"detect"}' --id agent
  "detail": "the widget is showing its checkbox"}
 ```
 
-Measured against the three real challenges (`python tools/captcha_check.py` → **18 checks,
-0 failed**):
+Measured against the three real challenges (`python tools/captcha_check.py` → **21 checks,
+0 failed, 0 not measurable**):
 
 | Challenge | What the browser does |
 |---|---|
-| Cloudflare Turnstile | **solves it** — one trusted click, the widget goes |
+| Cloudflare Turnstile | **solves it** — one click, the widget goes |
 | hCaptcha | reads the sitekey, clicks, opens the image challenge |
-| reCAPTCHA v2 | reads the sitekey, clicks, opens the challenge; the audio challenge is reachable and its token is read |
+| reCAPTCHA v2 | reads the sitekey, clicks, opens the challenge; the audio challenge is reachable, recorded and answered |
 
-What is *not* done: solving the image challenge, and solving the audio one. The audio
-route is the automatable one — capture what the browser actually plays through a WASAPI
-loopback and transcribe it locally — and that is the next piece of work, alongside a
-third-party solving API for the cases where neither works.
+The audio route needs no CDP and no injected script either. It records what the browser
+**actually played** through a WASAPI loopback of the output device, presses the
+challenge's own play control (the challenge does not start itself), transcribes the
+digits and types them back. Nothing is downloaded and no URL is parsed, so it does not
+depend on the challenge's internal structure:
+
+```json
+{"ok": true, "provider": "recaptcha", "state": "audio",
+ "play": "pressed the challenge's play control",
+ "device": "Speakers (Realtek)", "captured_seconds": 4.9,
+ "peak": 0.4595, "streams": "pid 14752 active peak 0.0388",
+ "solved_by": "api", "heard": "37194", "confidence": 1,
+ "typed": true, "input": "synthesized", "solved": false}
+```
+
+`solved_by` says where the digits came from: `local` is the Windows speech recogniser on
+this machine, `api` is a solving service — used only when no recogniser for the
+challenge's language is installed **and** a key is configured (`GHOST_CAPTCHA_KEY`, or
+`captcha_api_key` in the profile). There is no built-in key: with none configured the
+third tier is off, not broken. The upload is down-mixed to 16 kHz mono 16-bit, about
+157 KB for a five-second challenge.
+
+Two things are worth saying plainly. **`peak 0` has an innocent explanation** — the
+audio challenge does not autoplay, and until its play control is pressed the page holds
+an open stream that renders nothing, which is why `play` and `streams` are reported
+alongside the level. And **do not retry in a loop**: repeated attempts are themselves a
+bot signal. Ask once, report what you got, move on.
+
+What is *not* done: solving the image challenge, and driving hCaptcha's audio route,
+which goes through its accessibility menu.
 
 ### The window says "Ghost Browser"
 

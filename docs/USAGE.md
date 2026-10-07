@@ -468,60 +468,117 @@ A solved Cloudflare Turnstile looks like this:
 | `solved` | the widget is gone | continue |
 
 What actually happens today, measured against the three real challenges
-([`tools/captcha_check.py`](tools/captcha_check.py), **18 checks, 0 failed**):
+([`tools/captcha_check.py`](tools/captcha_check.py), **21 checks, 0 failed**):
 
 | challenge | result |
 |---|---|
-| Cloudflare Turnstile | **passes**, on one trusted click |
+| Cloudflare Turnstile | **passes**, on one click |
 | hCaptcha | sitekey read, checkbox clicked, image challenge opens |
 | reCAPTCHA v2 | sitekey read, checkbox clicked, image challenge opens; the audio button is reachable and opens the audio challenge |
+
+Every click reports which channel carried it (`input`), because a session with no
+foreground window cannot deliver synthesized input at all:
+
+| `input` | what it means |
+|---|---|
+| `synthesized` | a real `SendInput` — the page sees trusted events |
+| `accessibility` | the control was activated through the UI Automation invoke pattern — works with no foreground window, but `event.isTrusted` is false |
 
 ### Solving the audio challenge
 
 `action=solve-audio` takes the route that does not need to see the page: it opens
 the audio challenge, starts recording the default output device in loopback mode,
-asks for a replay so the clip starts inside the recording window, transcribes the
-digits locally and types them back. Nothing is downloaded and no URL is parsed —
-what gets transcribed is what the machine actually played.
+presses the challenge's own play control, transcribes the digits and types them
+back. Nothing is downloaded and no URL is parsed — what gets transcribed is what
+the machine actually played.
 
 ```json
 {
   "provider": "recaptcha",
   "state": "audio",
+  "play": "pressed the challenge's play control",
   "device": "Speakers (Realtek)",
-  "captured_seconds": 9.9,
-  "peak": 0.61,
-  "streams": "pid 4128 active peak 0.6000",
+  "captured_seconds": 4.9,
+  "peak": 0.4595,
+  "rms": 0.0242,
+  "streams": "pid 14752 active peak 0.0388",
+  "solved_by": "api",
   "heard": "37194",
-  "confidence": 0.91,
-  "typed": "37194",
-  "solved": true
+  "confidence": 1,
+  "typed": true,
+  "input": "synthesized",
+  "solved": false
 }
 ```
 
-Three fields are there for when it does *not* work, because "it heard nothing" has
-two very different causes and the samples cannot tell them apart:
+Four fields are there for when it does *not* work, because "it heard nothing" has
+several very different causes and the samples cannot tell them apart:
 
 - `peak` and `rms` — the level of what was captured. Zero means silence.
 - `streams` — who was holding a stream on the output device at that moment, and
   how loud. This is the same list the Windows volume mixer draws. If it is empty,
   the page never played anything and retrying will not help; if a browser process
   is `active` with a non-zero peak while `peak` is zero, the recording is at fault.
+- `play` — whether the challenge's own play control was pressed. **The audio
+  challenge does not start itself**: until that button is pressed the page holds an
+  open stream that renders nothing, which looks exactly like a silent page. This is
+  what `peak 0` turned out to be.
 - `confidence` — how sure the recogniser was. A wrong answer costs an attempt, so
   a low-confidence answer is reported as such rather than submitted blindly.
 
-Two honest limits on this machine, both written into
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §14.6: local speech-to-text needs a
-recogniser for the challenge's language (**only a Chinese one is installed here**,
-and installing an English one needs administrator rights), and the reCAPTCHA audio
-challenge measured `peak 0` in every run that reached it, which is still being
-explained.
+`confidence: 1` in the example above is not certainty about the audio — it means the
+answer did not come from the local recogniser. `solved_by` says where it came from:
+
+| `solved_by` | meaning |
+|---|---|
+| `local` | the digits came from the Windows speech recogniser on this machine |
+| `api` | the local recogniser had nothing, so the recording went to a solving service |
+
+### When there is no recogniser for the language
+
+Windows installs speech *recognisers* per language, and this is not the same list as
+its speech *voices*: a machine can have an English voice and no English recogniser
+at all. That is the case here — only a Chinese recogniser is installed, and adding an
+English one needs administrator rights. So English audio challenges cannot be
+transcribed locally.
+
+The third tier exists for exactly that gap. Give it a key and the same recording goes
+to a solving service instead:
+
+```powershell
+# Either in the environment...
+$env:GHOST_CAPTCHA_KEY = "your-2captcha-key"
+# ...or in the profile, next to the other fields
+ghost profile new work --out work.json   # then add "captcha_api_key": "your-key"
+```
+
+`GHOST_CAPTCHA_URL` points at a different service or a reseller, and defaults to
+`https://2captcha.com`. **There is no built-in key and there never will be** — with no
+key configured the third tier is *off*, not broken, and `solve-audio` stops at the
+honest refusal above. The upload is not the raw recording either: it is down-mixed and
+resampled to 16 kHz mono 16-bit, about 157 KB for a five-second challenge.
+
+The acceptance for this tier ([`tools/solve_api_check.py`](tools/solve_api_check.py))
+points `GHOST_CAPTCHA_URL` at a stand-in service on `127.0.0.1`, so it verifies the
+protocol and the pipeline — the form fields, the 16 kHz mono upload, the
+`CAPCHA_NOT_READY` polling, and that the answer is attributed to `api` — without
+spending money or depending on anyone's answer quality. It scores **12 checks,
+0 failed** when reCAPTCHA serves the audio challenge.
+
+It is rate-limited, and it says so rather than guessing: after enough attempts from one
+address reCAPTCHA first stops offering the audio route and then stops serving the widget
+at all, and the script reports that as **not measurable** instead of failed. The backoff
+between its attempts is deliberate — the refusal is rate-shaped, so hammering it is what
+causes it. If you see the gap, wait rather than retry.
 
 Two things are worth saying plainly. **A widget that is already there is not a
 failure** — Turnstile often passes with no visible challenge at all, and hCaptcha
 and reCAPTCHA only decide to escalate after you click. And **do not retry in a
 loop**: repeated attempts are themselves a bot signal and make things worse, not
-better. Ask once, report what you got, move on.
+better. Ask once, report what you got, move on. (The acceptance scripts retry only
+because a test has to distinguish a flaky challenge from a broken tier; they restart
+the browser rather than re-click, because clicking a checkbox that is already
+answered is itself a failure.)
 
 From an agent the same thing is one MCP call — `ghost_captcha`, with
 `action="solve-audio"` for the audio route.
@@ -530,9 +587,10 @@ From an agent the same thing is one MCP call — `ghost_captcha`, with
 
 This is a vertical slice, not a finished product. Not built yet:
 
-- **No CAPTCHA solving beyond Turnstile.** Reading the challenge and clicking the
-  checkbox works (§9). Image challenges are not solved, audio challenges are not
-  transcribed, and the third-party API tier is not wired up. The plan is in
+- **Image challenges are not solved.** Reading the challenge and clicking the
+  checkbox works, and audio challenges are recorded, transcribed and answered (§9),
+  but a picture grid is not classified. hCaptcha's audio route (which goes through
+  its accessibility menu) is not driven either. The plan is in
   `docs/ARCHITECTURE.md` §14.
 - **Windows x64 only.** Linux and macOS are designed in §8 and not implemented.
 - **No canvas / audio / font-metric spoofing.** Canvas hashing, audio

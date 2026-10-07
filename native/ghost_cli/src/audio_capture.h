@@ -80,6 +80,14 @@ CaptureResult capture_loopback(double seconds,
 // worth keeping -- to hand to a recogniser, and to listen to.
 bool write_wav(const std::string& path, const CaptureResult& capture, std::string* error);
 
+// Writes the capture as mono 16-bit PCM at `target_rate` (16000 when zero).
+//
+// This is the shape a remote solving service will accept. The render endpoint hands
+// back 44.1 kHz stereo, which is both more than speech needs and large enough that a
+// challenge longer than a few seconds cannot be uploaded at all.
+bool write_speech_wav(const std::string& path, const CaptureResult& capture,
+                      uint32_t target_rate = 16000, std::string* error = nullptr);
+
 // A short description for a log line: "Speakers (Realtek) 48000 Hz 2ch".
 std::string describe_capture(const CaptureResult& capture);
 

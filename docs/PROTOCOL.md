@@ -196,6 +196,11 @@ Returns `{"ok": true, "nodes": [...], "count": n}`. Each node:
 when the element has no visible area. `index` is only valid until the next `tree`
 or `find`, which replace the cached list.
 
+An `index` is a **position in the accessibility walk**, counted before any
+`role`/`name` filter is applied. So `find` and `tree` number the same element the
+same way, and an index from one can be handed to `click` after the other. A client
+that filters `find` results in its own code does not need to translate the indices.
+
 The page itself is the node with `role: "document"` and `id: "RootWebArea"`, and it
 is worth checking for by name, because it is the one thing browser chrome can never
 imitate — `id` and `value` are the fields to read, not just `name`.
@@ -233,18 +238,39 @@ Where to click is given in one of three ways:
 
 Plus optional `button` (default `left`) and `count` (default 1).
 
-The window is focused first. Returns `{"ok": true, "x": 144, "y": 256}` — the
-actual point clicked, which is useful for confirming what was resolved.
+The window is focused first. Returns `{"ok": true, "x": 144, "y": 256, "input":
+"synthesized"}` — the actual point clicked, which is useful for confirming what was
+resolved.
+
+`input` says which channel carried the click, and the two are **not equivalent**:
+
+| `input` | what happened |
+|---|---|
+| `synthesized` | a real `SendInput` click. The page sees a trusted event, exactly as from a person. |
+| `accessibility` | the control was activated through UI Automation. It changes the page, but `event.isTrusted` is false. |
+
+Synthesized input is always preferred. The accessibility channel is the fallback
+for a session that cannot deliver input at all (see [Sessions](#sessions)), and it
+is used only for a **plain left click on a named element** — a right click, a
+double click, or a bare coordinate has no accessibility equivalent, and those are
+refused rather than silently downgraded. A caller that cares whether the page saw a
+trusted event should read `input`.
 
 ### `type`
 
 | field | required | meaning |
 |---|---|---|
 | `text` | yes | literal text to type |
+| `index` | no | an element to write the text into |
 
-Types into whatever currently has focus. Returns `{"ok": true, "typed": 11}`.
-To type into a specific field, `click` it first — there is no "type into element"
-form, because that would mean synthesizing focus events instead of clicking.
+Without `index`, text goes to whatever currently has focus. Returns
+`{"ok": true, "typed": 11, "input": "synthesized"}`.
+
+With `index` the same channel rule applies: real keystrokes when the session can
+deliver them, otherwise the value is written through UI Automation's value
+interface and `input` is `accessibility`. Writing a value is not typing — no
+keystroke events are generated — which is why the channel is reported rather than
+hidden.
 
 ### `key`
 
@@ -282,11 +308,35 @@ Reads the human-verification challenge on the page and, when asked, clicks it.
 
 | field | default | meaning |
 |---|---|---|
-| `action` | `solve` | `detect` reads only; `solve` also clicks the checkbox and watches |
+| `action` | `solve` | `detect` reads only; `solve` also clicks the checkbox and watches; `solve-audio` records the audio challenge, transcribes it and answers it |
 | `timeout` | `30000` | milliseconds to keep watching after the click |
+| `seconds` | `10` | `solve-audio` only: how long to record, clamped to 2–30 |
+| `language` | `en` | `solve-audio` only: the recogniser language and the solving service's hint |
+| `keep` | `false` | `solve-audio` only: keep the recording and return its path as `wav`, instead of deleting it |
 
 Returns `provider`, `state`, `detail`, and when they are known `site_key`, `page_url`,
-`frame_url` and `challenge_token`; `solve` adds `clicked` and `elapsed_ms`.
+`frame_url` and `challenge_token`; `solve` adds `clicked`, `input` and `elapsed_ms`.
+`input` is `synthesized` or `accessibility` and means the same thing it does for
+`click` — read it before treating a solved challenge as evidence that a trusted click
+answered it.
+
+`solve-audio` additionally returns `play`, `device`, `captured_seconds`, `peak`, `rms`,
+`streams`, `solved_by`, `heard`, `confidence` and `typed`. It works with no foreground
+window, because every click it makes falls back to the accessibility channel.
+
+- `play` — whether the challenge's own play control was pressed. **The audio challenge
+  does not start itself**: until that button is pressed the page holds an open stream
+  that renders nothing, so `peak 0` and "the page played nothing" look identical.
+- `streams` — who held a stream on the output device during the recording, and how
+  loud. The same list the Windows volume mixer draws.
+- `solved_by` — `local` when the digits came from the machine's speech recogniser,
+  `api` when they came from a solving service.
+
+The third tier is off unless a key is configured. There is no built-in key. The key is
+taken from `GHOST_CAPTCHA_KEY`, or from `captcha_api_key` in the profile the server was
+started with; `GHOST_CAPTCHA_URL` overrides the service and defaults to
+`https://2captcha.com`. With no key, `provider` is empty and `solve-audio` stops at the
+local recogniser's honest refusal.
 
 `provider` is one of `none`, `hcaptcha`, `recaptcha`, `turnstile`. `state` is one of
 `absent`, `checkbox`, `visual`, `audio`, `solved`.
@@ -310,12 +360,16 @@ rectangle lands nowhere — then watches until the state settles:
   reaches this from the click alone.
 - `visual` — an image challenge is open. A person still has to solve it; this is
   where the browser's job ends and yours begins.
-- `audio` — an audio challenge is open. This is the state the local speech-to-text
-  path is meant to act on.
+- `audio` — an audio challenge is open. This is the state `solve-audio` acts on.
 
 `absent` right after a click is not "there is no challenge": it is what Cloudflare
 looks like while it verifies, because the checkbox is gone while the widget is still
 there. The command keeps watching through it.
+
+`index` values in `find` results are only meaningful against the tree they came from.
+A challenge that redraws between your `find` and your `click` invalidates them, which
+is why the command reads the tree again after every click it makes rather than reusing
+an index from before.
 
 ### `shutdown`
 
@@ -338,26 +392,42 @@ a few are worth recognizing:
 | `the browser has no visible window yet` | no window after 30 s of waiting |
 | `this session has no foreground window` | disconnected or headless session; see below |
 | `nothing matched role=... name contains "..."` | a `click` located by role/name found no target |
+| `no element with index N in the last tree` | the index is stale; call `tree` again |
+| `give x/y (screen), css_x/css_y (page), index (from tree), or role/name` | a click with no location |
+| `the control exposes no way to be activated` | the element offers no invoke, toggle, select or default action |
+| `unknown command: X` | typo, or a command from a newer version |
 
 Note that **`find` with no matches is not an error**: it returns
 `{"ok": true, "count": 0, "nodes": []}`. Only `click` turns an empty match into a
 failure, because a click that resolves to nothing cannot proceed. Client code must
 treat `count == 0` as a successful "nothing there" answer, not as a failed request.
-| `no element with index N in the last tree` | the index is stale; call `tree` again |
-| `give x/y (screen), css_x/css_y (page), index (from tree), or role/name` | a click with no location |
-| `unknown command: X` | typo, or a command from a newer version |
 
 ## Sessions
 
 Input synthesis needs a **connected, foreground-capable session**. On a
 disconnected RDP session or a headless one, `GetForegroundWindow()` returns null
-and Windows discards synthesized input *while reporting success* — so `click` and
-`type` would silently do nothing. Rather than let that look like a bug in your
-script, `focus`, `click`, `type`, `key`, `navigate` and `scroll` fail up front with
-`this session has no foreground window, so Windows discards synthesized input (a
-disconnected or headless session); connect the session and retry`.
+and Windows discards synthesized input *while reporting success*. Rather than let
+that look like a bug in your script, the control plane checks before synthesizing
+anything.
 
-`status`, `windows`, `tree`, `find` and `screenshot` work in any session.
+What happens next depends on whether the command can be carried out some other way:
+
+| command | in a session with no foreground window |
+|---|---|
+| `click` by `index` or `role`/`name` | falls back to UI Automation; reports `input: "accessibility"` |
+| `click` by `x`/`y`, with `button` other than left, or `count` > 1 | fails with `this session has no foreground window...` |
+| `type` with `index` | falls back to the accessibility value interface |
+| `type` without `index` | fails with the same message |
+| `focus`, `key`, `navigate`, `scroll` | fails with the same message |
+
+The failure text is `this session has no foreground window, so Windows discards
+synthesized input (a disconnected or headless session); connect the session and
+retry`.
+
+`status`, `windows`, `tree`, `find`, `screenshot` and `captcha` work in any
+session. `captcha action=solve-audio` also works without a foreground window: the
+audio comes off the render endpoint and the answer is written through
+accessibility, so the whole tier runs headless.
 
 ## Security
 

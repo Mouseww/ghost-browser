@@ -27,6 +27,12 @@ struct Element {
   RECT bounds{};  // physical screen pixels
 };
 
+// The traversal the control plane uses for every tree it hands out. An element
+// index is a position in this walk, so anything that reads an index and anything
+// that acts on one have to agree on it -- hence one definition, not two.
+constexpr int kTreeDepth = 30;
+constexpr int kTreeNodes = 4000;
+
 // Depth-first walk of the window's accessibility tree. Elements with neither a
 // name nor a value are still returned when `keep_anonymous` is set; without it
 // the result is limited to things a caller could actually address.
@@ -42,6 +48,27 @@ std::vector<Element> find_elements(HWND window, const std::string& role,
 // Centre of an element's bounds, in physical screen pixels — the coordinates
 // SendInput wants.
 bool element_center(const Element& element, int* x, int* y);
+
+// Act on a control through UI Automation itself, without synthesizing input.
+//
+// This exists because synthesized input needs a foreground window, and a session
+// that has none -- a disconnected RDP session, a service, a headless machine --
+// has Windows silently drop every SendInput. The accessibility tree is still
+// there in exactly those sessions, and the control can still be asked to do the
+// one thing it advertises. Tries Invoke, then Toggle, then Select, then the
+// legacy default action, and reports which of them was used.
+//
+// The trade is real and worth stating: an accessibility invocation reaches the
+// page as a *synthetic* action, so `event.isTrusted` is false, where a real
+// synthesized click produces a trusted one. Callers that care should prefer
+// SendInput and fall back to this only when the session cannot deliver input.
+bool invoke_element(HWND window, int index, std::string* error);
+
+// Put text into an edit control through UI Automation's value pattern. Same
+// trade as above: no keystrokes, no foreground window, but the page sees a
+// programmatic value change rather than typing.
+bool set_element_value(HWND window, int index, const std::string& text,
+                       std::string* error);
 
 // Waits for the page's document to appear in the accessibility tree, and returns
 // true if it did.

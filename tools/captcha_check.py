@@ -7,9 +7,10 @@ the renderer: no CDP, no injected script.
 
   python tools/captcha_check.py [--timeout 90] [--only NAME] [--keep-profile]
 
-Exit code 0 means every check passed. Checks that need synthesized input are
-reported as "not measurable" when the session has no foreground window, because
-Windows discards input in a disconnected session; the reading checks still run.
+Exit code 0 means every check passed. A session with no foreground window can still
+click: the control plane prefers real synthesized input and falls back to a UI
+Automation invocation, reporting which one it used in `input`. Only a check that has
+no accessibility equivalent is reported as "not measurable".
 """
 
 from __future__ import annotations
@@ -81,21 +82,27 @@ def wait_for_captcha(ghost: Ghost, timeout: float) -> dict:
 
 
 def solve(checks: Checks, ghost: Ghost, label: str, **kwargs):
-    """Ask for the challenge to be answered, tolerating a session with no input.
+    """Ask for the challenge to be answered, and record how the click was delivered.
 
-    Clicking activates the window first, because Windows discards synthesized input
-    aimed at a window that is not in the foreground. A disconnected or headless
-    session has no foreground window at all, so the click cannot be measured there —
-    but everything that only *reads* the challenge still can, which is why this is a
-    gap and not a failure.
+    The control plane prefers synthesized input -- the page sees a trusted event --
+    and falls back to a UI Automation invocation when the session cannot deliver any,
+    which is the normal case for a disconnected RDP or headless session. The fallback
+    still changes the page, but it is not trusted, so the channel is reported rather
+    than assumed: a check that passes on the fallback is weaker evidence than one that
+    passes on a real click, and the log should say which happened.
     """
     try:
-        return ghost.call("captcha", action="solve", **kwargs)
+        answer = ghost.call("captcha", action="solve", **kwargs)
     except GhostError as exc:
         if "no foreground window" in str(exc):
             checks.gap(label, "this session has no foreground window")
             return None
         raise
+    channel = answer.get("input", "")
+    print(f"  input  : {channel or 'not reported'}")
+    checks.true(f"{label}: the click reported which channel carried it",
+                channel in ("synthesized", "accessibility"))
+    return answer
 
 
 def run_target(checks: Checks, name: str, url: str, timeout: float,
@@ -142,9 +149,7 @@ def run_target(checks: Checks, name: str, url: str, timeout: float,
                             detected.get("page_url", ""))
                 checks.eq(f"{name}: it is waiting on its checkbox", state, "checkbox")
 
-                after = solve(checks, ghost,
-                              f"{name}: the click opens the image challenge",
-                              timeout=20000)
+                after = solve(checks, ghost, name, timeout=20000)
                 if after is None:
                     return
                 print(f"  after the click: state={after.get('state')} "
@@ -159,9 +164,7 @@ def run_target(checks: Checks, name: str, url: str, timeout: float,
                             key.startswith("6L") and len(key) >= 30, f"got {key!r}")
                 checks.eq(f"{name}: it is waiting on its checkbox", state, "checkbox")
 
-                after = solve(checks, ghost,
-                              f"{name}: the click opens the challenge frame",
-                              timeout=20000)
+                after = solve(checks, ghost, name, timeout=20000)
                 if after is None:
                     return
                 print(f"  after the click: state={after.get('state')} "
@@ -214,14 +217,12 @@ def run_target(checks: Checks, name: str, url: str, timeout: float,
                 checks.true(f"{name}: the widget is identified without a frame URL",
                             provider == "turnstile")
 
-                after = solve(checks, ghost,
-                              f"{name}: a trusted click answers the challenge",
-                              timeout=30000)
+                after = solve(checks, ghost, name, timeout=30000)
                 if after is None:
                     return
                 print(f"  after the click: state={after.get('state')} "
                       f"detail={after.get('detail')}")
-                checks.true(f"{name}: a trusted click answers the challenge",
+                checks.true(f"{name}: a click answers the challenge",
                             after.get("state") == "solved",
                             f"got {after.get('state')!r}")
 

@@ -247,6 +247,47 @@ CaptchaInfo analyze_captcha(const std::vector<Element>& nodes) {
     info.detail = "a widget is present but exposes no control";
   }
 
+  // The audio challenge does not start itself.
+  //
+  // reCAPTCHA's audio frame carries its own play control, and until that is pressed
+  // the audio element holds an open render session that produces nothing: measured on
+  // this machine, the capture saw `active peak 0.0000` for the whole window while the
+  // challenge sat waiting for a person. So the control has to be found -- and found
+  // without reading its label, which is a localized sentence ("按“播放”可听语音内容" here,
+  // "Press PLAY to listen" in English).
+  //
+  // It is identified structurally instead: inside the challenge frame it is the one
+  // button that is not one of reCAPTCHA's own named controls. Those all carry a
+  // `recaptcha-` automation id, which the vendor keeps stable across languages -- the
+  // same reason every other control here is matched by id.
+  //
+  // This is reCAPTCHA-only on purpose. hCaptcha reaches its audio challenge through
+  // the accessibility menu, which this file does not drive, so guessing at a button
+  // in an hCaptcha frame could press something that is not a play control.
+  if (info.provider == CaptchaProvider::kReCaptcha && info.state == CaptchaState::kAudio) {
+    size_t frame_at = nodes.size();
+    int frame_depth = 0;
+    for (size_t i = 0; i < nodes.size(); ++i) {
+      const Element& e = nodes[i];
+      if (e.role != "document" && e.role != "group") continue;
+      if (contains(lowered(e.value), "bframe")) {
+        frame_at = i;
+        frame_depth = e.depth;
+        break;
+      }
+    }
+    // A frame's subtree is contiguous in a depth-first walk, so the search stops at
+    // the first node that is no deeper than the frame itself.
+    for (size_t i = frame_at; i < nodes.size(); ++i) {
+      const Element& e = nodes[i];
+      if (i != frame_at && e.depth <= frame_depth) break;
+      if (e.role != "button") continue;
+      if (starts_with(e.automation_id, "recaptcha-")) continue;
+      info.play_button_index = e.index;
+      break;
+    }
+  }
+
   // hCaptcha answers a checkbox click with a picture grid, and its accessibility
   // menu is the documented way out of it. Recording the button's index here means
   // the caller never has to know that menu exists.

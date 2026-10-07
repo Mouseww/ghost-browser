@@ -50,6 +50,7 @@ struct CaptchaInfo {
   int verify_button_index = -1;
   int answer_field_index = -1;
   int refresh_button_index = -1;
+  int play_button_index = -1;    // the audio challenge's own play control
   int accessibility_index = -1;  // hCaptcha's accessibility menu
 
   std::string detail;  // why the state was chosen, for the log

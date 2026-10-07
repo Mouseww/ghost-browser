@@ -61,15 +61,31 @@ where that got you.
 - `state: solved` — the widget is gone; the challenge is answered.
 - `state: visual` — an image challenge is open. **You cannot solve this, and neither
   can the browser yet.** Report it to the user instead of burning attempts.
-- `state: audio` — an audio challenge is open. This is the automatable route and it
-  is not wired up yet, so treat it like `visual` for now.
+- `state: audio` — an audio challenge is open. Call `ghost_captcha` again with
+  `action="solve-audio"`: it records what the machine actually played, transcribes the
+  digits and types them back. Give it `language` (e.g. `en-US`) — the machine's speech
+  recognisers are installed per language, and it may not have one for the challenge's.
 
 Cloudflare Turnstile usually reaches `solved` from the click alone, so
 `ghost_captcha` can clear a Cloudflare interstitial on its own. hCaptcha and
-reCAPTCHA escalate, and the honest answer is that they stop there.
+reCAPTCHA escalate; for reCAPTCHA the audio route finishes the job, and for hCaptcha
+the honest answer is that it stops there.
+
+When `solve-audio` comes back empty, read the response before retrying:
+
+- `play` — whether the challenge's play control was pressed. The audio challenge does
+  not start itself, and an unpressed control looks exactly like a silent page.
+- `streams` — `nothing held a stream` means the page never played anything, so a retry
+  will not help. A browser process that is `active` while `peak` is `0` means the
+  recording, not the page, is at fault.
+- `solved_by` — `local` or `api`, so you know whether the answer came from this machine
+  or from a solving service. With no key configured the service tier is off, and the
+  command says so rather than failing obscurely.
 
 Do not retry a challenge in a loop. Repeated attempts are themselves a bot signal,
-and a challenge that fails often comes back harder.
+and a challenge that fails often comes back harder. If you must retry, restart the
+browser rather than clicking again — a half-clicked widget keeps its state, and
+clicking a checkbox that is already answered is itself a failure.
 
 ## What this browser deliberately cannot do
 

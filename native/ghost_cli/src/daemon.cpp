@@ -17,6 +17,7 @@
 #include "json.h"
 #include "launch.h"
 #include "pipe.h"
+#include "solve_api.h"
 #include "speech.h"
 #include "uia.h"
 #include "window.h"
@@ -31,6 +32,15 @@ struct Session {
   std::string profile_id;
   std::string data_dir;
   std::vector<Element> last_tree;
+  // Which channel the last interaction used: "synthesized" for real OS input,
+  // "accessibility" for a UI Automation invocation. They are not equivalent --
+  // only the first reaches the page as a trusted event -- so every response that
+  // clicked something says which one it was.
+  std::string last_input;
+  // The solving service's key, when the profile carries one. Kept on the session
+  // because the tier that needs it is reached from a request, and a request has no
+  // business carrying a secret the profile already states.
+  std::string captcha_api_key;
   bool verbose = false;
 };
 
@@ -57,6 +67,16 @@ std::string arg_string(const Json& request, const char* key) {
 double arg_number(const Json& request, const char* key, double fallback) {
   const Json* value = request.find(key);
   return value == nullptr ? fallback : value->as_number(fallback);
+}
+
+bool arg_bool(const Json& request, const char* key, bool fallback) {
+  const Json* value = request.find(key);
+  if (value == nullptr) return fallback;
+  if (value->type() == Json::Type::kBool) return value->as_bool(fallback);
+  // Numbers are accepted too, because a JSON encoder that has only numbers to hand
+  // will send 1/0 rather than true/false.
+  if (value->is_number()) return value->as_number(fallback ? 1.0 : 0.0) != 0.0;
+  return fallback;
 }
 
 Json element_json(const Element& element) {
@@ -325,7 +345,7 @@ Json cmd_find(Session& session, const Json& request) {
 // is gone" is that it was answered — the caller asked about a challenge it had
 // already been told exists.
 bool read_captcha(Session& session, CaptchaInfo* out, std::string* error) {
-  std::vector<Element> nodes = dump_tree(session.window, 30, 4000, false, error);
+  std::vector<Element> nodes = dump_tree(session.window, kTreeDepth, kTreeNodes, false, error);
   if (!error->empty()) return false;
   session.last_tree = nodes;
   *out = analyze_captcha(nodes);
@@ -338,20 +358,69 @@ bool read_captcha(Session& session, CaptchaInfo* out, std::string* error) {
 
 // Click whatever the tree says is at `index`. The index is only valid for the
 // most recent tree, so every caller re-reads before asking.
+//
+// Real synthesized input comes first: it is what a person produces, and only it
+// reaches the page as a trusted event. UI Automation's own invocation is the
+// fallback for sessions that cannot deliver input at all -- a disconnected RDP
+// session, a service, anything headless -- and it is recorded as such, because a
+// page can tell the two apart.
 bool click_node(Session& session, int index, std::string* error) {
+  const Element* target = nullptr;
   for (const Element& element : session.last_tree) {
-    if (element.index != index) continue;
-    int x = 0;
-    int y = 0;
-    if (!element_center(element, &x, &y)) {
-      *error = "the control has no visible area";
-      return false;
+    if (element.index == index) {
+      target = &element;
+      break;
     }
+  }
+  if (target == nullptr) {
+    *error = "the control is no longer on the page";
+    return false;
+  }
+
+  int x = 0;
+  int y = 0;
+  const bool reachable = element_center(*target, &x, &y);
+  std::string activation_error;
+  if (reachable && activate_window(session.window, &activation_error)) {
     click_at(x, y, "left", 1);
+    session.last_input = "synthesized";
     return true;
   }
-  *error = "the control is no longer on the page";
+
+  std::string invoke_error;
+  if (invoke_element(session.window, index, &invoke_error)) {
+    session.last_input = "accessibility";
+    return true;
+  }
+
+  if (!reachable) {
+    *error = "the control has no visible area, and " + invoke_error;
+  } else {
+    *error = activation_error +
+             "; the accessibility fallback also failed: " + invoke_error;
+  }
   return false;
+}
+
+// Put text into the field at `index`.
+//
+// Typing is the honest channel -- the page sees a person at a keyboard -- but
+// keystrokes have nowhere to land without a foreground window, and Windows drops
+// them silently rather than reporting a failure. So a session that cannot deliver
+// input writes the value through the accessibility interface instead, and the
+// caller reports which happened, because a page can tell the two apart.
+bool answer_field(Session& session, int index, const std::string& text,
+                  std::string* error) {
+  std::string activation_error;
+  if (activate_window(session.window, &activation_error)) {
+    if (!click_node(session, index, error)) return false;
+    type_text(text);
+    session.last_input = "synthesized";
+    return true;
+  }
+  if (!set_element_value(session.window, index, text, error)) return false;
+  session.last_input = "accessibility";
+  return true;
 }
 
 // Who is holding a stream on the render endpoint, if anyone.
@@ -387,7 +456,7 @@ Json cmd_captcha(Session& session, const Json& request) {
   const std::string action = arg_string(request, "action");
   const int timeout_ms = static_cast<int>(arg_number(request, "timeout", 30000));
 
-  std::vector<Element> nodes = dump_tree(session.window, 30, 4000, false, &error);
+  std::vector<Element> nodes = dump_tree(session.window, kTreeDepth, kTreeNodes, false, &error);
   if (!error.empty()) return failure(error);
   session.last_tree = nodes;
 
@@ -423,23 +492,15 @@ Json cmd_captcha(Session& session, const Json& request) {
   const ULONGLONG start = GetTickCount64();
 
   if (initial.state == CaptchaState::kCheckbox && initial.checkbox_index >= 0) {
-    if (!activate_window(session.window, &error)) return failure(error);
-
     for (int attempt = 0; attempt < 2; ++attempt) {
       Sleep(800);
       if (!read_captcha(session, &latest, &error)) return failure(error);
       if (latest.state != CaptchaState::kCheckbox || latest.checkbox_index < 0) break;
 
-      int x = 0;
-      int y = 0;
-      bool located = false;
-      for (const Element& element : session.last_tree) {
-        if (element.index != latest.checkbox_index) continue;
-        located = element_center(element, &x, &y);
-        break;
+      std::string click_error;
+      if (!click_node(session, latest.checkbox_index, &click_error)) {
+        return failure(click_error);
       }
-      if (!located) return failure("the challenge checkbox has no visible area");
-      click_at(x, y, "left", 1);
       clicked = true;
 
       // Give the click a few seconds to show an effect before deciding it missed.
@@ -460,7 +521,9 @@ Json cmd_captcha(Session& session, const Json& request) {
   // thing that goes back into the page is a typed answer -- so this runs under
   // exactly the same zero-CDP rule as the click does.
   if (action == "solve-audio") {
-    if (!activate_window(session.window, &error)) return failure(error);
+    // No upfront foreground requirement: the samples come off the render
+    // endpoint and the answer can go in through accessibility, so this tier runs
+    // in a session that cannot deliver synthesized input at all.
 
     // An image challenge is one click away from its audio sibling.
     if (latest.state == CaptchaState::kVisual && latest.audio_button_index >= 0) {
@@ -500,17 +563,36 @@ Json cmd_captcha(Session& session, const Json& request) {
                   static_cast<unsigned long>(::GetCurrentProcessId()));
     const std::string wav_path = dir + name;
 
-    // The clip plays once as the challenge opens, so the recorder has to be
-    // running before a replay is asked for. Asking for one is what makes the
-    // start of the audio land inside the capture window rather than before it.
+    // The challenge does not play itself. reCAPTCHA's audio frame keeps the clip
+    // behind its own play control, and until that control is pressed the audio
+    // element holds an open render session that produces nothing -- which is why a
+    // capture taken without this click measures `active peak 0.0000` and is
+    // indistinguishable from a page that simply stayed silent.
+    //
+    // The recorder starts first so that pressing the control lands inside the
+    // capture window rather than before it.
     CaptureResult captured;
     std::thread recorder([&captured, seconds, &wav_path]() {
       captured = capture_loopback(seconds, std::string(), wav_path);
     });
     Sleep(300);
-    if (latest.refresh_button_index >= 0) {
-      std::string click_error;
-      click_node(session, latest.refresh_button_index, &click_error);
+
+    const int play_index = latest.play_button_index;
+    if (play_index >= 0) {
+      std::string play_error;
+      if (click_node(session, play_index, &play_error)) {
+        out.set("play", Json::string("pressed the challenge's play control"));
+      } else {
+        out.set("play", Json::string("the play control could not be pressed: " + play_error));
+      }
+    } else {
+      // A challenge shaped differently, or one that autoplays. Asking for a replay is
+      // the best available way to put the start of the clip inside the window.
+      out.set("play", Json::string("the challenge exposes no play control"));
+      if (latest.refresh_button_index >= 0) {
+        std::string click_error;
+        click_node(session, latest.refresh_button_index, &click_error);
+      }
     }
     recorder.join();
 
@@ -535,11 +617,57 @@ Json cmd_captcha(Session& session, const Json& request) {
     }
 
     const std::string language = arg_string(request, "language");
-    const Transcript transcript = recognize_wav(wav_path, language, true);
-    ::DeleteFileA(wav_path.c_str());
+    Transcript transcript = recognize_wav(wav_path, language, true);
+    // Which tier produced the answer. The local engine ships with the machine and
+    // costs nothing, so it always goes first; a service is consulted only when it
+    // had nothing to say, because on a machine with no recognizer for the
+    // challenge's language that is exactly what it will say.
+    std::string solved_by = "local";
+    const SolveApi api = resolve_solve_api(arg_string(request, "key"),
+                                           session.captcha_api_key);
+    if (transcript.digits.empty() && !api.provider.empty()) {
+      // The service wants a small upload, and the render endpoint's 44.1 kHz stereo
+      // is neither small nor necessary for speech.
+      const std::string speech_path = wav_path + ".16k.wav";
+      std::string convert_error;
+      std::string api_digits;
+      std::string api_error;
+      if (!write_speech_wav(speech_path, captured, 16000, &convert_error)) {
+        out.set("api", Json::string(convert_error));
+      } else if (solve_audio_api(api, speech_path,
+                                 language.empty() ? std::string("en") : language,
+                                 &api_digits, &api_error)) {
+        transcript.digits = api_digits;
+        transcript.text = api_digits;
+        transcript.confidence = 1.0;
+        // The local engine's failure has been answered, so it is no longer the
+        // verdict. Leaving `ok` false here would report the local error and never
+        // use the answer the service just gave.
+        transcript.ok = true;
+        transcript.error.clear();
+        solved_by = "api";
+      } else {
+        out.set("api", Json::string(api_error));
+      }
+      ::DeleteFileA(speech_path.c_str());
+    }
+    out.set("solved_by", Json::string(solved_by));
+    // A failed transcription is the interesting case, and it cannot be diagnosed from
+    // the samples alone -- too quiet, too short and wrong-language all look alike in
+    // the numbers. `keep` leaves the recording behind so the caller can measure it.
+    if (arg_bool(request, "keep", false)) {
+      out.set("wav", Json::string(wav_path));
+    } else {
+      ::DeleteFileA(wav_path.c_str());
+    }
     if (!transcript.text.empty()) out.set("transcript", Json::string(transcript.text));
     if (!transcript.digits.empty()) out.set("heard", Json::string(transcript.digits));
     out.set("confidence", Json::number(transcript.confidence));
+    // Which engine answered. Silence from the wrong language and silence from a bad
+    // recording are the same number, and the culture is what tells them apart.
+    if (!transcript.recognizer.empty()) {
+      out.set("recognizer", Json::string(transcript.recognizer));
+    }
     if (!transcript.ok) {
       out.set("solved", Json::boolean(false));
       out.set("detail", Json::string(transcript.error));
@@ -547,17 +675,25 @@ Json cmd_captcha(Session& session, const Json& request) {
     }
     if (transcript.digits.empty()) {
       out.set("solved", Json::boolean(false));
-      out.set("detail", Json::string(
-                            "the audio held nothing that sounded like digits"));
+      // The capture already proved that sound was there, so an empty transcript is
+      // about the engine, not the audio. Saying which engine makes the difference
+      // between "retry" and "this machine cannot hear this challenge".
+      std::string detail = "the audio held nothing that sounded like digits";
+      if (!transcript.recognizer.empty()) {
+        detail += " (the local recognizer is " + transcript.recognizer +
+                  "; a recognizer for the challenge's language may be needed)";
+      }
+      out.set("detail", Json::string(detail));
       return out;
     }
 
-    std::string click_error;
-    if (!click_node(session, latest.answer_field_index, &click_error)) {
-      return failure(click_error);
+    std::string answer_error;
+    if (!answer_field(session, latest.answer_field_index, transcript.digits,
+                      &answer_error)) {
+      return failure(answer_error);
     }
-    type_text(transcript.digits);
     Sleep(200);
+    std::string click_error;
     if (latest.verify_button_index >= 0) {
       if (!click_node(session, latest.verify_button_index, &click_error)) {
         return failure(click_error);
@@ -572,6 +708,7 @@ Json cmd_captcha(Session& session, const Json& request) {
       if (after.state != CaptchaState::kAudio) break;
     }
     out.set("typed", Json::boolean(true));
+    out.set("input", Json::string(session.last_input));
     out.set("state", Json::string(captcha_state_name(after.state)));
     out.set("detail", Json::string(after.detail));
     out.set("solved", Json::boolean(after.state == CaptchaState::kSolved));
@@ -594,6 +731,12 @@ Json cmd_captcha(Session& session, const Json& request) {
   }
 
   out.set("clicked", Json::boolean(clicked));
+  // Which channel carried the click matters to anyone reading this: a challenge
+  // answered by an accessibility invocation is not the same as one answered by a
+  // trusted click, even when the visible state ends up identical.
+  if (clicked && !session.last_input.empty()) {
+    out.set("input", Json::string(session.last_input));
+  }
   out.set("state", Json::string(captcha_state_name(latest.state)));
   out.set("detail", Json::string(latest.detail));
   if (latest.provider != initial.provider) {
@@ -606,31 +749,70 @@ Json cmd_captcha(Session& session, const Json& request) {
 Json cmd_click(Session& session, const Json& request) {
   std::string error;
   if (!refresh(session, &error)) return failure(error);
-  if (!activate_window(session.window, &error)) return failure(error);
+
+  const std::string button = arg_string(request, "button");
+  const int count = static_cast<int>(arg_number(request, "count", 1));
+  const bool plain = (button.empty() || button == "left") && count == 1;
+
+  // A pointer click needs a session Windows will accept input in. When this one
+  // cannot deliver input, a named control can still be activated through the
+  // accessibility interface -- but only a plain left click, because that is the
+  // only gesture that interface expresses. A right click or a double click has
+  // no equivalent, and is refused rather than silently downgraded to something
+  // that is not what the caller asked for.
+  std::string activation_error;
+  if (!activate_window(session.window, &activation_error)) {
+    const Json* index = request.find("index");
+    if (index == nullptr || !plain) return failure(activation_error);
+    const int node = static_cast<int>(index->as_number());
+    std::string click_error;
+    if (!click_node(session, node, &click_error)) return failure(click_error);
+    Json out = success();
+    out.set("index", Json::integer(node));
+    out.set("input", Json::string(session.last_input));
+    return out;
+  }
 
   int x = 0;
   int y = 0;
   if (!resolve_point(request, session, &x, &y, &error)) return failure(error);
 
-  const std::string button = arg_string(request, "button");
-  const int count = static_cast<int>(arg_number(request, "count", 1));
   click_at(x, y, button.empty() ? "left" : button, count);
+  session.last_input = "synthesized";
 
   Json out = success();
   out.set("x", Json::integer(x));
   out.set("y", Json::integer(y));
+  out.set("input", Json::string(session.last_input));
   return out;
 }
 
 Json cmd_type(Session& session, const Json& request) {
   std::string error;
   if (!refresh(session, &error)) return failure(error);
-  if (!activate_window(session.window, &error)) return failure(error);
   const std::string text = arg_string(request, "text");
   if (text.empty()) return failure("type needs text");
+
+  // Keystrokes need a foreground window; a named field does not. Same rule as
+  // clicking: use the honest channel when it is available, say so when it is not.
+  std::string activation_error;
+  if (!activate_window(session.window, &activation_error)) {
+    const Json* index = request.find("index");
+    if (index == nullptr) return failure(activation_error);
+    const int node = static_cast<int>(index->as_number());
+    if (!set_element_value(session.window, node, text, &error)) return failure(error);
+    session.last_input = "accessibility";
+    Json out = success();
+    out.set("typed", Json::integer(static_cast<long long>(text.size())));
+    out.set("input", Json::string(session.last_input));
+    return out;
+  }
+
   type_text(text);
+  session.last_input = "synthesized";
   Json out = success();
   out.set("typed", Json::integer(static_cast<long long>(text.size())));
+  out.set("input", Json::string(session.last_input));
   return out;
 }
 
@@ -771,6 +953,12 @@ int run_serve(const ServeOptions& options) {
   session.profile_id = options.profile_id;
   session.data_dir = options.data_dir;
   session.verbose = options.verbose;
+  if (!options.profile_json.empty()) {
+    std::string parse_error;
+    const Json profile = Json::parse(options.profile_json, &parse_error);
+    const Json* key = profile.find("captcha_api_key");
+    if (key != nullptr) session.captcha_api_key = key->as_string();
+  }
 
   if (options.attach_pid != 0) {
     session.pid = options.attach_pid;

@@ -38,8 +38,8 @@ file(TO_CMAKE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/assets/ghost.ico" GHOST_ICON_PAT
 
 # One version string for every artifact, so the shim and the launcher cannot
 # disagree about which build is running.
-set(GHOST_VERSION 0.7.0)
-set(GHOST_VERSION_COMMA 0,7,0,0)
+set(GHOST_VERSION 0.8.0)
+set(GHOST_VERSION_COMMA 0,8,0,0)
 
 # ---------------------------------------------------------------------------
 # ghost_shim — the injected native layer
@@ -108,6 +108,7 @@ add_executable(ghost
   ghost_cli/src/captcha.cpp
   ghost_cli/src/audio_capture.cpp
   ghost_cli/src/speech.cpp
+  ghost_cli/src/solve_api.cpp
   common/probe_report.cpp
   "${CMAKE_CURRENT_BINARY_DIR}/ghost.rc")
 target_include_directories(ghost PRIVATE ghost_cli/src)
@@ -119,7 +120,7 @@ target_include_directories(ghost PRIVATE ghost_cli/src)
 # sapi: the OS speech engine, which transcribes the audio half of a challenge
 # without bundling a model into this single-file exe.
 target_link_libraries(ghost PRIVATE advapi32 shcore user32 version shell32 ole32 oleaut32
-  uiautomationcore gdi32 sapi)
+  uiautomationcore gdi32 sapi winhttp)
 add_dependencies(ghost ghost_shim)
 # The resource script references the built shim, but CMake cannot see through
 # rc.exe. Without this the exe would silently keep embedding a stale shim after
