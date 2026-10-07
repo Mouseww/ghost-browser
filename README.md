@@ -33,7 +33,7 @@ needed to work on the source or run the fingerprint test page under `harness/`.
 | Font enumeration (`document.fonts`, `measureText`) | **working** — DirectWrite collection filtered |
 | Zero-CDP control plane (`ghost serve`) | **working** — 19 checks |
 | Working with no foreground window | **working** — falls back to UI Automation and says which channel it used |
-| Reading a human-verification challenge | **working** — 21 checks |
+| Reading a human-verification challenge | **working** — 33 checks |
 | Clearing Cloudflare Turnstile | **working** — one click answers it |
 | hCaptcha / reCAPTCHA image challenges | **read and opened, not solved** |
 | reCAPTCHA audio challenge | **recorded, transcribed and answered** — locally, or by a service when no recogniser fits |
@@ -236,7 +236,7 @@ ghost call '{"cmd":"captcha","action":"detect"}' --id agent
  "detail": "the widget is showing its checkbox"}
 ```
 
-Measured against the three real challenges (`python tools/captcha_check.py` → **21 checks,
+Measured against the three real challenges (`python tools/captcha_check.py` → **33 checks,
 0 failed, 0 not measurable**):
 
 | Challenge | What the browser does |
@@ -266,6 +266,28 @@ challenge's language is installed **and** a key is configured (`GHOST_CAPTCHA_KE
 `captcha_api_key` in the profile). There is no built-in key: with none configured the
 third tier is off, not broken. The upload is down-mixed to 16 kHz mono 16-bit, about
 157 KB for a five-second challenge.
+
+**One look is not a detection.** The widget animates in — on this machine Cloudflare's
+interstitial exposes no challenge at all for its first ~1.2 s, and hCaptcha's checkbox
+for ~1.2 s. During that window a page that is about to challenge you looks exactly like
+a page that never will, so `captcha` keeps looking for up to `wait_ms` (default 3000;
+pass `0` for the old single sample) before it will say `provider: none`, and reports
+`appeared_ms` so you can tell a fast page from a slow one.
+
+If you want to watch rather than act, `action=wait` clicks nothing: it reports whether a
+challenge appeared, how long that took, and whether it then cleared by itself.
+
+```json
+{"ok": true, "provider": "turnstile", "state": "checkbox",
+ "appeared": true, "appeared_ms": 953, "cleared": false,
+ "waited_ms": 9094, "clicked": false,
+ "detail": "the widget is showing its checkbox"}
+```
+
+`cleared: false` is the honest answer for that demo: it never passes on its own, so
+patience is not a solution and the command does not pretend otherwise. `wait` stops
+early once a challenge settles into an image or audio one, because those are waiting for
+a person.
 
 Two things are worth saying plainly. **`peak 0` has an innocent explanation** — the
 audio challenge does not autoplay, and until its play control is pressed the page holds

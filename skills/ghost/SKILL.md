@@ -58,6 +58,14 @@ sees inside the challenge's cross-origin iframe — and reports the provider, th
 state, and the sitekey. With `action="solve"` it also clicks the checkbox and says
 where that got you.
 
+**One look is not a detection.** The widget animates in, so for roughly the first
+second a page that is about to challenge you looks exactly like a page that never
+will. `ghost_captcha` already accounts for this — it keeps looking for up to `wait_ms`
+(default 3000) and reports `appeared_ms` — but do not conclude "no challenge" from a
+tree you read yourself too early. If you want to watch without acting, use
+`action="wait"`: it clicks nothing and reports `appeared`, `appeared_ms`, `cleared` and
+`waited_ms`. A challenge that is only being verified needs time, not input.
+
 - `state: solved` — the widget is gone; the challenge is answered.
 - `state: visual` — an image challenge is open. **You cannot solve this, and neither
   can the browser yet.** Report it to the user instead of burning attempts.

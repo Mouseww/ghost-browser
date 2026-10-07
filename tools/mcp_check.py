@@ -266,6 +266,15 @@ def main() -> int:
         checks.contains("ghost_captcha solve-audio refuses a plain page",
                         audio_text, "no human-verification challenge")
 
+        # And the watch tier has to say what it actually did: it waited, nothing
+        # appeared, and it clicked nothing. A page with no challenge is the only place
+        # where "nothing appeared" is the correct answer, so it is checked here.
+        result = client.call_tool("ghost_captcha", {"action": "wait", "timeout": 2000})
+        wait_text = text_of(result)
+        checks.true("ghost_captcha wait runs", not result.get("isError"), wait_text)
+        checks.contains("ghost_captcha wait reports that nothing challenged the page",
+                        wait_text, "no human-verification challenge appeared")
+
         # Navigation drives the real address bar, so it needs a foreground window.
         result = client.call_tool("ghost_navigate", {"url": "https://example.com"},
                                   timeout=args.timeout)

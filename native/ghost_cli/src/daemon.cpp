@@ -356,6 +356,39 @@ bool read_captcha(Session& session, CaptchaInfo* out, std::string* error) {
   return true;
 }
 
+// Wait for a challenge to name itself, and say how long that took.
+//
+// A single look is not a detection. The widget animates in, and measured on this
+// machine the gap is not subtle: Cloudflare's interstitial exposes no challenge
+// at all for its first ~1.2 s, and hCaptcha's checkbox for ~1.2 s, so during that
+// window a page that is about to challenge you and a page that never will are the
+// same picture. Reporting "no challenge" from one sample sends an agent into a
+// blocked page with nothing to solve, which is precisely the failure the first
+// tier exists to prevent.
+//
+// `appeared_ms` comes back as -1 when nothing appeared before the deadline, which
+// is a different answer from "it appeared instantly" and is reported as such.
+bool wait_for_challenge(Session& session, CaptchaInfo* out, int wait_ms,
+                        long long* appeared_ms, std::string* error) {
+  const ULONGLONG start = GetTickCount64();
+  for (;;) {
+    error->clear();
+    std::vector<Element> nodes = dump_tree(session.window, kTreeDepth, kTreeNodes, false, error);
+    if (!error->empty()) return false;
+    session.last_tree = nodes;
+    *out = analyze_captcha(nodes);
+    if (out->provider != CaptchaProvider::kNone) {
+      *appeared_ms = static_cast<long long>(GetTickCount64() - start);
+      return true;
+    }
+    if (static_cast<long long>(GetTickCount64() - start) >= wait_ms) {
+      *appeared_ms = -1;
+      return true;
+    }
+    Sleep(200);
+  }
+}
+
 // Click whatever the tree says is at `index`. The index is only valid for the
 // most recent tree, so every caller re-reads before asking.
 //
@@ -456,21 +489,73 @@ Json cmd_captcha(Session& session, const Json& request) {
   const std::string action = arg_string(request, "action");
   const int timeout_ms = static_cast<int>(arg_number(request, "timeout", 30000));
 
+  // How long the *first* look is allowed to keep looking. A caller that genuinely
+  // wants one sample can pass `wait_ms: 0` and get the old behaviour.
+  const int wait_ms = static_cast<int>(arg_number(request, "wait_ms", 3000));
+  const ULONGLONG command_start = GetTickCount64();
+
   std::vector<Element> nodes = dump_tree(session.window, kTreeDepth, kTreeNodes, false, &error);
   if (!error.empty()) return failure(error);
   session.last_tree = nodes;
 
-  const CaptchaInfo initial = analyze_captcha(nodes);
+  CaptchaInfo initial = analyze_captcha(nodes);
+  long long appeared_ms = initial.provider == CaptchaProvider::kNone ? -1 : 0;
+
+  // `wait` is the tier that exists to not act, so it gets the whole timeout to
+  // watch a challenge arrive; every other action just needs the loading gap
+  // covered before it decides there is nothing here.
+  const int appear_budget = (action == "wait") ? timeout_ms : wait_ms;
+  if (initial.provider == CaptchaProvider::kNone && appear_budget > 0) {
+    if (!wait_for_challenge(session, &initial, appear_budget, &appeared_ms, &error)) {
+      return failure(error);
+    }
+  }
 
   Json out = success();
   out.set("provider", Json::string(captcha_provider_name(initial.provider)));
   out.set("state", Json::string(captcha_state_name(initial.state)));
   out.set("detail", Json::string(initial.detail));
+  if (appeared_ms >= 0) out.set("appeared_ms", Json::integer(appeared_ms));
   if (!initial.site_key.empty()) out.set("site_key", Json::string(initial.site_key));
   if (!initial.page_url.empty()) out.set("page_url", Json::string(initial.page_url));
   if (!initial.frame_url.empty()) out.set("frame_url", Json::string(initial.frame_url));
   if (!initial.challenge_token.empty()) {
     out.set("challenge_token", Json::string(initial.challenge_token));
+  }
+
+  // Wait for the challenge to arrive, and then for it to go away on its own.
+  // Nothing is clicked: a challenge that is merely being verified needs time
+  // rather than input, and clicking into that window is guessing.
+  if (action == "wait") {
+    out.set("clicked", Json::boolean(false));
+    out.set("appeared", Json::boolean(initial.provider != CaptchaProvider::kNone));
+
+    CaptchaInfo watched = initial;
+    bool cleared = false;
+    if (watched.provider != CaptchaProvider::kNone) {
+      while (GetTickCount64() - command_start < static_cast<ULONGLONG>(timeout_ms)) {
+        Sleep(250);
+        if (!read_captcha(session, &watched, &error)) return failure(error);
+        // Gone entirely, or reported solved: either way it passed without us.
+        if (watched.provider == CaptchaProvider::kNone ||
+            watched.state == CaptchaState::kSolved) {
+          cleared = true;
+          break;
+        }
+        // An image or audio challenge is waiting for a person. Waiting longer
+        // will not change that, and spending the caller's whole deadline on a
+        // foregone conclusion is not patience, it is waste.
+        if (watched.state == CaptchaState::kVisual ||
+            watched.state == CaptchaState::kAudio) {
+          break;
+        }
+      }
+    }
+    out.set("cleared", Json::boolean(cleared));
+    out.set("waited_ms", Json::integer(static_cast<long long>(GetTickCount64() - command_start)));
+    out.set("state", Json::string(captcha_state_name(watched.state)));
+    out.set("detail", Json::string(watched.detail));
+    return out;
   }
 
   if (action == "detect" || initial.provider == CaptchaProvider::kNone) {

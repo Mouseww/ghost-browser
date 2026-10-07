@@ -79,7 +79,7 @@ but `ghost serve` does not exist there yet.
 | `ghost_type` | `text` | Type into the focused field |
 | `ghost_key` | `key` \| `keys[]` | Press a key or a combination |
 | `ghost_scroll` | `delta?`, `css_x?`, `css_y?` | Scroll |
-| `ghost_captcha` | `action?` (`detect`/`solve`/`solve-audio`), `timeout?`, `seconds?`, `language?`, `keep?` | Read, click, or record-and-answer a human-verification challenge |
+| `ghost_captcha` | `action?` (`detect`/`wait`/`solve`/`solve-audio`), `timeout?`, `wait_ms?`, `seconds?`, `language?`, `keep?` | Read, watch, click, or record-and-answer a human-verification challenge |
 | `ghost_screenshot` | — | Capture the window as PNG |
 | `ghost_close` | — | Close the browser and stop the server |
 
@@ -93,6 +93,13 @@ and returns the provider, the state and the sitekey; with `action="solve"` it cl
 the checkbox and reports where that got you. Cloudflare Turnstile usually passes from
 that click alone. hCaptcha and reCAPTCHA escalate to an image or audio challenge,
 which the tool reports honestly rather than pretending to have solved.
+
+**One look is not a detection.** The widget animates in, so for roughly the first
+second a page that is about to challenge you looks exactly like a page that never will.
+`ghost_captcha` keeps looking for up to `wait_ms` (default 3000; `0` restores a single
+sample) before it will say `provider: none`, and reports `appeared_ms`. `action="wait"`
+clicks nothing and reports `appeared`, `appeared_ms`, `cleared` and `waited_ms` — use it
+when a challenge is being verified and needs time rather than input.
 
 The audio challenge is the automatable one: `action="solve-audio"` records what the
 machine actually played, transcribes the digits and types them back, and says whether

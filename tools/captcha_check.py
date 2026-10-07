@@ -123,6 +123,37 @@ def run_target(checks: Checks, name: str, url: str, timeout: float,
         # nothing about reading a challenge needs input.
         with Ghost(profile).start(url) as ghost:
             data_dir = ghost.data_dir()
+
+            # Tier 1: the first look, taken the instant the browser is up.
+            #
+            # This is the check that would have caught the bug it was written for. The
+            # widget animates in, so a single sample taken immediately reported
+            # `provider: none` on Cloudflare and hCaptcha -- and an agent reading that
+            # concludes the page has no challenge and walks into a blocked page.
+            # Measured before the fix: nothing named at all. After it: Cloudflare named
+            # at 953 ms and hCaptcha at 891 ms.
+            first = ghost.call("captcha", action="detect")
+            print(f"  first look : provider={first.get('provider')} "
+                  f"state={first.get('state')} appeared_ms={first.get('appeared_ms')}")
+            checks.true(f"{name}: the first look names the challenge",
+                        first.get("provider") != "none",
+                        "the widget animates in, so one sample taken immediately can "
+                        "miss a challenge that is still loading")
+            checks.true(f"{name}: the first look reports how long it waited",
+                        isinstance(first.get("appeared_ms"), int)
+                        and first["appeared_ms"] >= 0)
+
+            # Tier 1 also has to be able to watch without acting: a challenge that is
+            # only being verified needs time, and clicking into that window is guessing.
+            watch = ghost.call("captcha", action="wait", timeout=4000)
+            print(f"  wait       : appeared={watch.get('appeared')} "
+                  f"appeared_ms={watch.get('appeared_ms')} "
+                  f"cleared={watch.get('cleared')} waited_ms={watch.get('waited_ms')}")
+            checks.true(f"{name}: watching touches nothing",
+                        watch.get("clicked") is False)
+            checks.true(f"{name}: watching sees the challenge",
+                        watch.get("appeared") is True)
+
             detected = wait_for_captcha(ghost, timeout)
             provider = detected.get("provider", "none")
             state = detected.get("state", "?")

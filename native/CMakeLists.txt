@@ -38,8 +38,8 @@ file(TO_CMAKE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/assets/ghost.ico" GHOST_ICON_PAT
 
 # One version string for every artifact, so the shim and the launcher cannot
 # disagree about which build is running.
-set(GHOST_VERSION 0.8.0)
-set(GHOST_VERSION_COMMA 0,8,0,0)
+set(GHOST_VERSION 0.9.0)
+set(GHOST_VERSION_COMMA 0,9,0,0)
 
 # ---------------------------------------------------------------------------
 # ghost_shim — the injected native layer

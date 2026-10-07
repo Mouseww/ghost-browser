@@ -45,7 +45,7 @@ PROTOCOL_VERSION = "2025-06-18"
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 
 SERVER_NAME = "ghost"
-SERVER_VERSION = "0.8.0"
+SERVER_VERSION = "0.9.0"
 
 DEFAULT_ID = os.environ.get("GHOST_ID") or "mcp"
 READY_TIMEOUT = float(os.environ.get("GHOST_TIMEOUT") or 60)
@@ -488,8 +488,14 @@ TOOLS = [
         "name": "ghost_captcha",
         "description": (
             "Handle a human-verification challenge (hCaptcha, reCAPTCHA, Cloudflare "
-            "Turnstile). With action='detect' it only reports what is there, "
-            "including the sitekey. With action='solve' it clicks the checkbox and "
+            "Turnstile). With action='wait' it touches nothing and just watches: it "
+            "waits for a challenge to appear and then for it to pass on its own, "
+            "reporting appeared/appeared_ms/cleared. Use it when a challenge may be "
+            "transient or may only be verifying, and use it before concluding there "
+            "is no challenge at all — the widget animates in, so a page about to "
+            "challenge you looks like a page with none for about a second. With "
+            "action='detect' it only reports what is there, including the sitekey. "
+            "With action='solve' it clicks the checkbox and "
             "waits: Cloudflare Turnstile is usually answered outright, while "
             "hCaptcha and reCAPTCHA escalate to an image or audio challenge that a "
             "person still has to solve. With action='solve-audio' it opens the audio "
@@ -504,10 +510,15 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["detect", "solve", "solve-audio"],
+                "action": {"type": "string",
+                           "enum": ["detect", "solve", "solve-audio", "wait"],
                            "default": "solve"},
                 "timeout": {"type": "integer", "default": 30000,
                             "description": "milliseconds to keep watching"},
+                "wait_ms": {"type": "integer", "default": 3000,
+                            "description": "how long the first look may keep looking "
+                                           "for a challenge to appear; 0 means a "
+                                           "single sample"},
                 "seconds": {"type": "integer", "default": 10,
                             "description": "seconds of audio to record for solve-audio"},
                 "language": {"type": "string",
@@ -664,7 +675,8 @@ def run_tool(session: Session, name: str, args: dict) -> dict:
 
     if name == "ghost_captcha":
         action = args.get("action") or "solve"
-        params = {"action": action, "timeout": int(args.get("timeout", 30000))}
+        params = {"action": action, "timeout": int(args.get("timeout", 30000)),
+                  "wait_ms": int(args.get("wait_ms", 3000))}
         if action == "solve-audio":
             params["seconds"] = int(args.get("seconds", 10))
             if args.get("language"):
@@ -675,6 +687,10 @@ def run_tool(session: Session, name: str, args: dict) -> dict:
         provider = response.get("provider", "none")
         state = response.get("state", "?")
         if provider == "none":
+            if action == "wait":
+                return tool_result(
+                    "no human-verification challenge appeared within "
+                    f"{response.get('waited_ms', 0)} ms of watching")
             return tool_result("no human-verification challenge on this page")
 
         lines = [f"provider: {provider}", f"state:    {state}"]
@@ -684,6 +700,12 @@ def run_tool(session: Session, name: str, args: dict) -> dict:
             lines.append(f"page:     {response['page_url']}")
         if response.get("detail"):
             lines.append(f"detail:   {response['detail']}")
+        if action == "wait":
+            lines.append(f"appeared: {bool(response.get('appeared'))}")
+            if response.get("appeared_ms") is not None:
+                lines.append(f"in:       {response['appeared_ms']} ms")
+            lines.append(f"cleared:  {bool(response.get('cleared'))}")
+            lines.append(f"waited:   {response.get('waited_ms')} ms")
         if action == "solve":
             lines.append(f"clicked:  {bool(response.get('clicked'))}")
         if action == "solve-audio":
@@ -714,7 +736,15 @@ def run_tool(session: Session, name: str, args: dict) -> dict:
             if response.get("wav"):
                 lines.append(f"wav:      {response['wav']}")
 
-        if state == "solved":
+        if action == "wait":
+            if not response.get("appeared"):
+                lines.append("nothing challenged this page while we watched")
+            elif response.get("cleared"):
+                lines.append("the challenge appeared and then passed on its own")
+            else:
+                lines.append("the challenge appeared and is still there -- it did not "
+                             "pass by itself, so it needs action='solve'")
+        elif state == "solved":
             lines.append("the challenge is answered")
         elif state == "visual":
             lines.append("an image challenge is open; a person still has to solve it")

@@ -5,6 +5,50 @@ All notable changes to this project are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-10-07
+
+### Added
+
+- **`captcha action=wait`: watch a challenge arrive, and watch it leave, without
+  touching it.** A challenge that is only being verified needs time rather than input,
+  and clicking into that window is guessing. `wait` clicks nothing, reports `appeared`,
+  `appeared_ms`, `cleared` and `waited_ms`, and stops early once the challenge settles
+  into an image or audio one, because those are waiting for a person and more waiting
+  cannot change that. Measured on Cloudflare's interstitial: `appeared: true` at
+  **953 ms**, `cleared: false` after 9 s — that demo never passes on its own, and the
+  command says so instead of pretending patience is a solution.
+
+### Fixed
+
+- **The first look at a challenge is no longer a single sample.** The widget animates
+  in, and the gap is not subtle: measured on this machine, Cloudflare's interstitial
+  exposes no challenge at all for its first **~1.2 s**, and hCaptcha's checkbox for
+  **~1.2 s**. During that window a page that is about to challenge you and a page that
+  never will are the same picture, so `captcha` used to answer `provider: none` — and an
+  agent reading that concludes there is no challenge and walks into a blocked page,
+  which is the one failure the first tier exists to prevent. Detection now keeps looking
+  for up to `wait_ms` (default 3000; `0` restores the single-sample behaviour) before it
+  will say `none`, and reports `appeared_ms` so a caller can tell a fast page from a slow
+  one. Measured after the fix: Cloudflare named at **953 ms**, hCaptcha at **891 ms**,
+  reCAPTCHA at **171 ms** — where all three previously said `none`. Acceptance grew from
+  21 to **33 checks, 0 failed, 0 not measurable** (`tools/captcha_check.py`), because the
+  tier that was missing its most important property was also the one nobody was checking.
+
+### Investigated
+
+- **hCaptcha's audio route is a measured dead end, not an oversight.** hCaptcha is the
+  one provider whose audio challenge is still not driven, so it was worth finding out
+  why. Its challenge frame does expose a button named `About hCaptcha & Accessibility
+  Options` — with no automation id, so it can only be found by name — and hCaptcha's own
+  image alt text points at that menu for "Get Cookie" and "Text Challenge". Activating it
+  through UI Automation, however, changes nothing in the tree for ten seconds, sampled
+  once a second. The same invoke pattern *does* work on hCaptcha's checkbox (the state
+  goes `checkbox` → `visual`), so the obstacle is the control rather than the channel: the
+  checkbox is a real form control, the menu button is a custom element that Chromium gives
+  a button role without wiring up its handler. A real mouse event might work, and that
+  needs a foreground-capable session this machine does not have. Recorded as a limitation
+  with its evidence rather than left as an unexplained gap.
+
 ## [0.8.0] - 2026-10-07
 
 ### Added

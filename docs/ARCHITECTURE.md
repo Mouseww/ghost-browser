@@ -738,6 +738,16 @@ mask 恢复默认后 `19 checks, 0 failed`。**证明移除它们的就是字体
   (installed: zh-CN)`），不会假装听懂。这不是第二级的设计缺陷，而是它的边界，也正是第三级存在的
   理由。
 
+- **hCaptcha 的音频路线在当前实现下不可达，而且原因是控件而不是我们没找对地方。** 挑战帧里确实有
+  一个按钮，名字就是 `About hCaptcha & Accessibility Options`（**没有 automation id**，只能靠名字
+  找），挑战图片自己的替代文本也在提示「请使用辅助功能菜单里的『检索 Cookie』或『文本验证』」。但
+  经 UIA 的 Invoke 模式点它之后，**10 秒内树完全不变**（49 个节点，逐秒采样前后一致）。同一个
+  Invoke 模式点 hCaptcha 自己的复选框是有效的（状态从 `checkbox` 变 `visual`），所以差别不在通道
+  而在控件：复选框是真正的表单控件，那个菜单按钮是自定义元素，Chromium 给了它 UIA 按钮角色，但
+  激活它并不触发页面的处理器。要让真实鼠标事件生效需要前台窗口，而本会话没有——**因此这一条是
+  「在本机实测不可达」，不是「大概不行」**。reCAPTCHA 之所以能走通，正是因为它把音频做成了一个
+  带 `recaptcha-audio-button` id 的真按钮。
+
 **这一层可用的正对照。** 判断「环回→STT 这条路到底行不行」不能只看挑战：本机 TTS 合成中文数字
 `三八五一二四` 播进一个 `<audio autoplay loop>` 页面，环回采到 `44100 Hz 2ch 32-bit 4.99s`、
 `silent 0 frames`、`peak 0.955259`，`ghost __speech <wav> zh --digits` 转写出 `385124`、

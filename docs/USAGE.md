@@ -443,8 +443,32 @@ is already running (`ghost serve --id work` in another window):
 ```
 ghost call --id work "{\"cmd\":\"captcha\"}"                          # detect, then try to solve
 ghost call --id work "{\"cmd\":\"captcha\",\"action\":\"detect\"}"    # only report
+ghost call --id work "{\"cmd\":\"captcha\",\"action\":\"wait\",\"timeout\":30000}"
 ghost call --id work "{\"cmd\":\"captcha\",\"action\":\"solve-audio\",\"language\":\"en-US\"}"
 ```
+
+**One look is not a detection.** The widget animates in, and the gap is not subtle: on
+this machine Cloudflare's interstitial exposes no challenge at all for its first
+**~1.2 s**, and hCaptcha's checkbox for **~1.2 s**. During that window a page that is
+about to challenge you and a page that never will are the same picture. So `detect`
+keeps looking for up to `wait_ms` (default `3000`; `0` restores the old single sample)
+before it will say `provider: none`, and reports `appeared_ms` so you can tell a fast
+page from a slow one. Measured: Cloudflare named at **953 ms**, hCaptcha at **891 ms**,
+reCAPTCHA at **171 ms** — all three previously answered `none`.
+
+If you want to watch rather than act, `action=wait` clicks nothing. It reports
+`appeared`, `appeared_ms`, `cleared` and `waited_ms`, and stops early once the challenge
+settles into an image or audio one, because those are waiting for a person and more
+waiting cannot change that:
+
+```json
+{"ok": true, "provider": "turnstile", "state": "checkbox",
+ "appeared": true, "appeared_ms": 953, "cleared": false,
+ "waited_ms": 9094, "clicked": false}
+```
+
+`cleared: false` is the honest answer for that demo — it never passes on its own, so
+patience is not a solution and the command does not pretend otherwise.
 
 A solved Cloudflare Turnstile looks like this:
 
@@ -468,7 +492,7 @@ A solved Cloudflare Turnstile looks like this:
 | `solved` | the widget is gone | continue |
 
 What actually happens today, measured against the three real challenges
-([`tools/captcha_check.py`](tools/captcha_check.py), **21 checks, 0 failed**):
+([`tools/captcha_check.py`](tools/captcha_check.py), **33 checks, 0 failed**):
 
 | challenge | result |
 |---|---|
@@ -589,9 +613,16 @@ This is a vertical slice, not a finished product. Not built yet:
 
 - **Image challenges are not solved.** Reading the challenge and clicking the
   checkbox works, and audio challenges are recorded, transcribed and answered (§9),
-  but a picture grid is not classified. hCaptcha's audio route (which goes through
-  its accessibility menu) is not driven either. The plan is in
-  `docs/ARCHITECTURE.md` §14.
+  but a picture grid is not classified.
+- **hCaptcha's audio route is not driven, and that is a measured dead end rather than
+  an oversight.** The challenge frame does expose a button named `About hCaptcha &
+  Accessibility Options` (with no automation id), and hCaptcha's own image alt text
+  points at it for "Get Cookie" and "Text Challenge". But activating it through UI
+  Automation changes nothing in the tree for ten seconds, while the *same* invoke
+  pattern works on hCaptcha's checkbox — so the obstacle is that the menu button is a
+  custom element that does not respond to the pattern, not that the route was missed.
+  A real mouse event might work; that needs a foreground-capable session, which this
+  machine's RDP session does not have. See `docs/ARCHITECTURE.md` §14.6.
 - **Windows x64 only.** Linux and macOS are designed in §8 and not implemented.
 - **No canvas / audio / font-metric spoofing.** Canvas hashing, audio
   fingerprinting and font metrics are still measured from the real machine. See

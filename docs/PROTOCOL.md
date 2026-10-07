@@ -308,8 +308,9 @@ Reads the human-verification challenge on the page and, when asked, clicks it.
 
 | field | default | meaning |
 |---|---|---|
-| `action` | `solve` | `detect` reads only; `solve` also clicks the checkbox and watches; `solve-audio` records the audio challenge, transcribes it and answers it |
-| `timeout` | `30000` | milliseconds to keep watching after the click |
+| `action` | `solve` | `detect` reads only; `wait` reads and watches without clicking; `solve` also clicks the checkbox and watches; `solve-audio` records the audio challenge, transcribes it and answers it |
+| `timeout` | `30000` | milliseconds to keep watching after the click, or for `wait` to keep watching at all |
+| `wait_ms` | `3000` | how long the *first* look may keep looking for a challenge to appear; `0` means a single sample |
 | `seconds` | `10` | `solve-audio` only: how long to record, clamped to 2–30 |
 | `language` | `en` | `solve-audio` only: the recogniser language and the solving service's hint |
 | `keep` | `false` | `solve-audio` only: keep the recording and return its path as `wav`, instead of deleting it |
@@ -319,6 +320,27 @@ Returns `provider`, `state`, `detail`, and when they are known `site_key`, `page
 `input` is `synthesized` or `accessibility` and means the same thing it does for
 `click` — read it before treating a solved challenge as evidence that a trusted click
 answered it.
+
+**One look is not a detection.** The widget animates in: measured on this machine,
+Cloudflare's interstitial exposes no challenge at all for its first ~1.2 s and
+hCaptcha's checkbox for ~1.2 s. During that window a page that is about to challenge
+you and a page that never will are the same picture, so the first look keeps looking
+for up to `wait_ms` before it is willing to say `provider: none`. When a challenge is
+found, `appeared_ms` says how long that took; it is absent when nothing appeared.
+
+`action=wait` clicks nothing. It watches for a challenge to arrive (using the whole
+`timeout` for that), then watches for it to leave on its own, and reports:
+
+- `appeared` — whether a challenge named itself at all.
+- `appeared_ms` — how long that took.
+- `cleared` — whether it then went away without being touched. A challenge that is
+  only being verified clears; one that wants a person does not.
+- `waited_ms` — the total time spent watching.
+- `clicked` — always `false`, so a caller can tell this action from `solve`.
+
+`wait` stops early when the challenge settles into `visual` or `audio`, because those
+are waiting for a person and more waiting cannot change that. Use it when a challenge
+may be transient, and before concluding a page has no challenge at all.
 
 `solve-audio` additionally returns `play`, `device`, `captured_seconds`, `peak`, `rms`,
 `streams`, `solved_by`, `heard`, `confidence` and `typed`. It works with no foreground
@@ -425,9 +447,11 @@ synthesized input (a disconnected or headless session); connect the session and
 retry`.
 
 `status`, `windows`, `tree`, `find`, `screenshot` and `captcha` work in any
-session. `captcha action=solve-audio` also works without a foreground window: the
-audio comes off the render endpoint and the answer is written through
-accessibility, so the whole tier runs headless.
+session. `captcha action=wait` and `captcha action=detect` only read, so they never
+need input at all; `captcha action=solve-audio` also works without a foreground
+window: the audio comes off the render endpoint and the answer is written through
+accessibility, so the whole tier runs headless. Only the checkbox click in
+`action=solve` needs the accessibility fallback.
 
 ## Security
 
