@@ -214,6 +214,8 @@ noise_seed = HMAC-SHA256(profile_seed, origin + ":" + surface)[0..8]
 
 `cf_clearance` 按 **profile × 域名** 持久化到 profile 目录，新会话直接复用。
 
+**落地情况（见 §14）**：识别层与第①级已完成。`ghost captcha` 能读出挑战的 provider、状态与 sitekey，并用一次可信点击清掉 Cloudflare Turnstile。第②级的入口已经可达——reCAPTCHA 的 `recaptcha-audio-button` 能被点开、状态转为 `audio`、`bft` token 已能读出——但音频采集、转写与填入都还没做。第③级未做。
+
 ---
 
 ## 7. L5 行为引擎
@@ -597,4 +599,89 @@ mask 恢复默认后 `19 checks, 0 failed`。**证明移除它们的就是字体
   字体被换成了 fallback，度量会露馅。
 - **仍是进程级的。** 钩子装在哪个进程就只影响哪个进程；渲染进程能否被注入仍然取决于
   §10.2 的沙箱问题。
+
+---
+
+## 14. L4 验证码通道 — 零 CDP 下怎么拿到题目
+
+### 14.1 难点不是解题，是拿题
+
+三级降级里，②③都要求先知道**这是什么挑战、sitekey 是什么、挑战 frame 的 token 是什么**。
+在 CDP 时代这是 `Runtime.evaluate` 一行的事；零 CDP 之后它成了整件事的门槛。
+
+答案在无障碍树里。两个性质让它在没有 CDP 的情况下也能工作：
+
+1. **UIA 能看进跨域 iframe。** 挑战控件作为嵌套的 `document`/`group` 节点出现：hCaptcha 是
+   `document '包含 hCaptcha 安全挑战复选框的小部件'`，reCAPTCHA 是 `group 'reCAPTCHA'`，
+   Turnstile 是 `document '包含 Cloudflare 安全质询的小组件'`。
+2. **document 节点的 `value` 就是该 frame 的 URL。** 于是 sitekey 不用猜、不用注入，直接
+   从 URL 里解析：
+
+   ```
+   https://newassets.hcaptcha.com/captcha/v1/.../hcaptcha.html#frame=checkbox&...&sitekey=a5f74b19-...
+   https://www.google.com/recaptcha/api2/anchor?ar=1&k=6Le-wvkSAAAAAPBMRTvw0Q4Muexq9bi0DJwx_mJ-&...
+   https://www.google.com/recaptcha/api2/bframe?...&k=6Le-...&bft=0dAFcWeA40KW7...
+   ```
+
+   第三条里的 `bft` 就是图像挑战的 token —— 正是打码服务要的东西。**第③级因此也能在零 CDP
+   下实现。**
+
+### 14.2 实现
+
+`native/ghost_cli/src/captcha.{h,cpp}` 是**纯函数**：树进，结论出。它只返回节点下标、不自己
+点击 —— 输入投递留在 `daemon.cpp`，这样识别逻辑可以脱离浏览器测试。
+
+判定顺序是有讲究的：
+
+| 顺序 | 条件 | 状态 |
+|---|---|---|
+| 1 | 答案输入框存在（`audio-response`） | `kAudio` |
+| 2 | 任一 frame URL 含 `frame=challenge` 或 `bframe` | `kVisual` |
+| 3 | checkbox 存在 | `kCheckbox` |
+| 4 | 都没有 | `kAbsent` |
+
+**checkbox 必须最后判**：reCAPTCHA 点完之后 anchor 的 checkbox 还留在屏幕上，先判它就会把
+已经升级成图像挑战的状态永远报成 `checkbox`。
+
+控件一律按 **automation id** 匹配（`checkbox`、`recaptcha-anchor`、`recaptcha-audio-button`、
+`recaptcha-verify-button`、`audio-response`、`menu-info`），不按可见文本 —— 本机标签全是中文，
+按文本匹配会失败。
+
+### 14.3 三个把它做错过的坑
+
+1. **页面自己就住在厂商域名上。** hCaptcha 的 demo 页是 `accounts.hcaptcha.com`，reCAPTCHA 的
+   是 `google.com/recaptcha/api2/demo`，所以「value 里含厂商域名」这个判据会命中**页面级
+   document 自己**，在一个还没有 widget 的页面上报出 widget。修法是先按 `depth` 找出最浅的
+   document 作为页面 URL，再在识别循环里跳过它。
+2. **只看第一个 frame 不够。** reCAPTCHA 点击后 anchor frame 仍然开着、bframe 另开一个；
+   hCaptcha 则把同一个 frame 从 `frame=checkbox` 换成 `frame=challenge`。只看「第一个命中厂商
+   的 frame」会永远看不到挑战。现在先把**全部** frame URL 收集起来，再据整组判断。
+3. **widget 是动画出现的。** 第一次读到的矩形在点击落下时已经过期一两帧，落进这个空档的点击
+   等于没点。现在点击前先 `Sleep(800)` 重读一次坐标，若状态没变再点一次。
+
+### 14.4 实测
+
+`python tools/captcha_check.py` → **18 checks, 0 failed**：
+
+| 挑战 | 结果 |
+|---|---|
+| Cloudflare Turnstile（嵌入式 widget） | **一次可信点击直接通过**（`state=solved`，widget 消失，页面标题变为 `NopeCHA - CAPTCHA Demo`） |
+| Cloudflare 全页 interstitial（`请稍候…`） | 同样识别为 `turnstile`：挑战 frame 在 `challenges.cloudflare.com`，复选框名为 `请验证您是真人` 且**没有 automation id** —— 这正是 Turnstile 必须按名字匹配、并且它的 checkbox 必须最后判的原因 |
+| hCaptcha | 读出 `site_key=a5f74b19-9e45-40e0-b45d-47ff91b7a6c2`，点击后 `state=visual`（图像挑战打开，无障碍菜单可用） |
+| reCAPTCHA v2 | 读出 `site_key=6Le-wvkSAAAAAPBMRTvw0Q4Muexq9bi0DJwx_mJ-`，点击后 `state=visual`；音频按钮可达，点它后 `state=audio`，`bft` token 读出 |
+
+### 14.5 还没做的
+
+- **图像挑战不求解。** 这是有意的：本项目其余部分都不假装做到了没做到的事。
+- **音频挑战不转写。** 入口已经打开（能点开、能读到 `audio-response` 输入框），但采集与 STT
+  未做。计划是 **WASAPI 环回采集浏览器实际播放的音频**，而不是去下载音频 URL —— 那样既不
+  需要注入，也不依赖挑战的 URL 结构，而且拿到的就是浏览器真正听到的东西。
+- **第③级打码 API 未做。** 所需的 sitekey 与 `bft` token 现在已经能读出来了。
+- **`cf_clearance` 的持久化不用自己做。** 它就是一个普通 cookie，Chromium 本来就会把它写进
+  profile 的 Cookies 库，所以同一个 profile 第二次访问就不再被挑战。这既是好事（通过一次
+  就够），也是**验收测试必须每次用全新 profile** 的原因：复用 profile 的
+  `tools/captcha_check.py` 会静默退化成「我们已经拿到 clearance」的测试，把读取路径的回归
+  全部藏起来。实测：复用 profile 时 `nopecha.com/demo/cloudflare` 直接给 demo 页，树里一个
+  widget 都没有，而全新 profile 三次里三次都在 3–5 秒内看到 Cloudflare 的全页 Turnstile
+  挑战（`请稍候…` + `challenges.cloudflare.com` frame + `请验证您是真人` 复选框）。
 

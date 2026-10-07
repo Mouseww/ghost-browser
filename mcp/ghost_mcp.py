@@ -45,7 +45,7 @@ PROTOCOL_VERSION = "2025-06-18"
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 
 SERVER_NAME = "ghost"
-SERVER_VERSION = "0.5.0"
+SERVER_VERSION = "0.6.0"
 
 DEFAULT_ID = os.environ.get("GHOST_ID") or "mcp"
 READY_TIMEOUT = float(os.environ.get("GHOST_TIMEOUT") or 60)
@@ -485,6 +485,27 @@ TOOLS = [
         },
     },
     {
+        "name": "ghost_captcha",
+        "description": (
+            "Handle a human-verification challenge (hCaptcha, reCAPTCHA, Cloudflare "
+            "Turnstile). With action='detect' it only reports what is there, "
+            "including the sitekey. With action='solve' it clicks the checkbox and "
+            "waits: Cloudflare Turnstile is usually answered outright, while "
+            "hCaptcha and reCAPTCHA escalate to an image or audio challenge that a "
+            "person still has to solve."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["detect", "solve"],
+                           "default": "solve"},
+                "timeout": {"type": "integer", "default": 30000,
+                            "description": "milliseconds to keep watching"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "ghost_screenshot",
         "description": "Capture the browser window and return it as a PNG image.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
@@ -607,6 +628,34 @@ def run_tool(session: Session, name: str, args: dict) -> dict:
             params["css_y"] = args["css_y"]
         response = session.call("scroll", **params)
         return tool_result(f"scrolled by {response.get('delta')}")
+
+    if name == "ghost_captcha":
+        action = args.get("action") or "solve"
+        response = session.call("captcha", action=action,
+                                timeout=int(args.get("timeout", 30000)))
+        provider = response.get("provider", "none")
+        state = response.get("state", "?")
+        if provider == "none":
+            return tool_result("no human-verification challenge on this page")
+
+        lines = [f"provider: {provider}", f"state:    {state}"]
+        if response.get("site_key"):
+            lines.append(f"sitekey:  {response['site_key']}")
+        if response.get("page_url"):
+            lines.append(f"page:     {response['page_url']}")
+        if response.get("detail"):
+            lines.append(f"detail:   {response['detail']}")
+        if action == "solve":
+            lines.append(f"clicked:  {bool(response.get('clicked'))}")
+
+        if state == "solved":
+            lines.append("the challenge is answered")
+        elif state == "visual":
+            lines.append("an image challenge is open; a person still has to solve it")
+        elif state == "audio":
+            lines.append("an audio challenge is open — this is the route that can be "
+                         "solved automatically once local speech-to-text is wired up")
+        return tool_result("\n".join(lines))
 
     if name == "ghost_screenshot":
         # Write to a temp path rather than the default cache location, so repeated

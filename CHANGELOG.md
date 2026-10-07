@@ -5,6 +5,43 @@ All notable changes to this project are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-10-07
+
+### Added
+
+- **Human-verification challenges can be read, and Cloudflare Turnstile can be
+  cleared.** `ghost captcha` reports the provider, the state and the sitekey, and with
+  `action=solve` clicks the checkbox and reports where that left it. It reads the
+  accessibility tree rather than the DOM, which works because that tree already reaches
+  inside the challenge's cross-origin iframe, and because a challenge frame's document
+  node carries its own URL as its `value` — the sitekey is parsed out of that URL. No
+  CDP, no injected script. Measured against the three real challenges:
+  [`tools/captcha_check.py`](tools/captcha_check.py) reports **18 checks, 0 failed**.
+  Cloudflare Turnstile is answered outright by one trusted click. hCaptcha and
+  reCAPTCHA are identified and clicked open; their audio challenges are reachable and
+  reCAPTCHA's challenge token is read, but nothing solves them yet.
+- `ghost_captcha` in the MCP server, so an agent does not have to hunt for the checkbox
+  itself.
+
+### Fixed
+
+- **The accessibility tree is primed at session start.** Chromium builds its
+  accessibility tree lazily, and the first query is what asks for it — so the first
+  `tree` or `find` after a fresh browser returned a chrome-only tree with no document
+  in it, which is indistinguishable from an empty page. A client that read once and
+  concluded the page was blank was told the truth about the tree and a lie about the
+  page. The server now queries once at startup, and again whenever the window handle
+  changes.
+- **`navigator.deviceMemory` is capped at 32 GiB**, not at the machine's size. Measured
+  across 4/8/16/32/48/64 GiB: 4→4, 8→8, 16→16, 32→32, 48→32, 64→32. The harness expected
+  the raw capacity, so a profile with 64 GiB failed a spoof that was behaving correctly.
+- **`{"cmd":"call"}` deadlocked the server.** It re-sent the request to the pipe it was
+  itself serving, nesting a connection into a single-threaded server until the client
+  timed out.
+- Three protocol details the language clients found: `--pipe` is the literal pipe name
+  rather than a suffix on `ghost-<id>`; `find` with no matches is a successful empty
+  answer rather than an error; and `status.pipe` returns the bare name.
+
 ## [0.5.0] - 2026-10-07
 
 ### Added

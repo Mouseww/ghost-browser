@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "captcha.h"
 #include "capture.h"
 #include "chrome.h"
 #include "embed.h"
@@ -308,6 +309,128 @@ Json cmd_find(Session& session, const Json& request) {
   return out;
 }
 
+// Reads the human-verification challenge on the page, clicks its checkbox when
+// that is what it is waiting for, and reports what happened.
+//
+// Most of the value is in the reading rather than the clicking: the reply names the
+// provider, the sitekey and the frame the answer came from, which is what a caller
+// needs to decide between waiting, solving the audio challenge, and handing the
+// sitekey to a solving service. For Cloudflare Turnstile the click alone is usually
+// the whole task, so this command can finish a challenge outright.
+// Reads the challenge as it stands now. A widget that has disappeared is reported as
+// solved rather than absent, because after a click the only sensible reading of "it
+// is gone" is that it was answered — the caller asked about a challenge it had
+// already been told exists.
+bool read_captcha(Session& session, CaptchaInfo* out, std::string* error) {
+  std::vector<Element> nodes = dump_tree(session.window, 30, 4000, false, error);
+  if (!error->empty()) return false;
+  session.last_tree = nodes;
+  *out = analyze_captcha(nodes);
+  if (out->provider == CaptchaProvider::kNone) {
+    out->state = CaptchaState::kSolved;
+    out->detail = "the widget is gone";
+  }
+  return true;
+}
+
+Json cmd_captcha(Session& session, const Json& request) {
+  std::string error;
+  if (!refresh(session, &error)) return failure(error);
+
+  const std::string action = arg_string(request, "action");
+  const int timeout_ms = static_cast<int>(arg_number(request, "timeout", 30000));
+
+  std::vector<Element> nodes = dump_tree(session.window, 30, 4000, false, &error);
+  if (!error.empty()) return failure(error);
+  session.last_tree = nodes;
+
+  const CaptchaInfo initial = analyze_captcha(nodes);
+
+  Json out = success();
+  out.set("provider", Json::string(captcha_provider_name(initial.provider)));
+  out.set("state", Json::string(captcha_state_name(initial.state)));
+  out.set("detail", Json::string(initial.detail));
+  if (!initial.site_key.empty()) out.set("site_key", Json::string(initial.site_key));
+  if (!initial.page_url.empty()) out.set("page_url", Json::string(initial.page_url));
+  if (!initial.frame_url.empty()) out.set("frame_url", Json::string(initial.frame_url));
+  if (!initial.challenge_token.empty()) {
+    out.set("challenge_token", Json::string(initial.challenge_token));
+  }
+
+  if (action == "detect" || initial.provider == CaptchaProvider::kNone) {
+    out.set("clicked", Json::boolean(false));
+    return out;
+  }
+
+  // The one step worth taking automatically is the click that starts the challenge.
+  // It is unambiguous — there is exactly one checkbox and one thing it means — and
+  // for Turnstile it is often the entire task.
+  //
+  // The widget animates in, so the rectangle read on the first look can be a frame or
+  // two stale by the time a click lands; a click delivered into that gap does nothing,
+  // which is indistinguishable from a page refusing the click. So the tree is re-read
+  // after a short settle, and a click that produces no change is retried once against
+  // fresh coordinates.
+  CaptchaInfo latest = initial;
+  bool clicked = false;
+  const ULONGLONG start = GetTickCount64();
+
+  if (initial.state == CaptchaState::kCheckbox && initial.checkbox_index >= 0) {
+    if (!activate_window(session.window, &error)) return failure(error);
+
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      Sleep(800);
+      if (!read_captcha(session, &latest, &error)) return failure(error);
+      if (latest.state != CaptchaState::kCheckbox || latest.checkbox_index < 0) break;
+
+      int x = 0;
+      int y = 0;
+      bool located = false;
+      for (const Element& element : session.last_tree) {
+        if (element.index != latest.checkbox_index) continue;
+        located = element_center(element, &x, &y);
+        break;
+      }
+      if (!located) return failure("the challenge checkbox has no visible area");
+      click_at(x, y, "left", 1);
+      clicked = true;
+
+      // Give the click a few seconds to show an effect before deciding it missed.
+      const ULONGLONG clicked_at = GetTickCount64();
+      while (GetTickCount64() - clicked_at < 3500) {
+        Sleep(250);
+        if (!read_captcha(session, &latest, &error)) return failure(error);
+        if (latest.state != CaptchaState::kCheckbox) break;
+      }
+      if (latest.state != CaptchaState::kCheckbox) break;
+    }
+  }
+
+  // Then watch the rest of the way. The widget disappearing means it was answered;
+  // changing shape means it escalated to something a person still has to solve, which
+  // is the caller's business rather than ours.
+  //
+  // `absent` is watched too, and that is not the same as "there is no challenge": it
+  // is what Cloudflare looks like while it verifies, because the checkbox is gone but
+  // the widget is still there. Stopping at that point reported a challenge that was
+  // busy passing as one that had failed.
+  while (clicked && (latest.state == CaptchaState::kCheckbox ||
+                     latest.state == CaptchaState::kAbsent) &&
+         GetTickCount64() - start < static_cast<ULONGLONG>(timeout_ms)) {
+    Sleep(250);
+    if (!read_captcha(session, &latest, &error)) return failure(error);
+  }
+
+  out.set("clicked", Json::boolean(clicked));
+  out.set("state", Json::string(captcha_state_name(latest.state)));
+  out.set("detail", Json::string(latest.detail));
+  if (latest.provider != initial.provider) {
+    out.set("provider", Json::string(captcha_provider_name(latest.provider)));
+  }
+  out.set("elapsed_ms", Json::integer(static_cast<long long>(GetTickCount64() - start)));
+  return out;
+}
+
 Json cmd_click(Session& session, const Json& request) {
   std::string error;
   if (!refresh(session, &error)) return failure(error);
@@ -416,6 +539,7 @@ Json dispatch(Session& session, const Json& request, bool* stop) {
   if (command == "navigate") return cmd_navigate(session, request);
   if (command == "tree") return cmd_tree(session, request);
   if (command == "find") return cmd_find(session, request);
+  if (command == "captcha") return cmd_captcha(session, request);
   if (command == "click") return cmd_click(session, request);
   if (command == "type") return cmd_type(session, request);
   if (command == "key") return cmd_key(session, request);

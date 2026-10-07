@@ -28,7 +28,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "0.5.0";
+constexpr const char* kVersion = "0.6.0";
 constexpr const char* kDefaultId = "default";
 
 void print_usage() {

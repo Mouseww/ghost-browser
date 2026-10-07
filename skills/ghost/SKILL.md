@@ -46,6 +46,27 @@ and Node.
 coordinates, or raw `x`/`y` screen pixels. Prefer an index from a page read you
 just did: coordinates go stale as soon as the layout shifts.
 
+## Human-verification challenges
+
+Call `ghost_captcha` rather than hunting for the checkbox yourself. It reads the
+challenge out of the accessibility tree — the same tree `ghost_page` walks, which
+sees inside the challenge's cross-origin iframe — and reports the provider, the
+state, and the sitekey. With `action="solve"` it also clicks the checkbox and says
+where that got you.
+
+- `state: solved` — the widget is gone; the challenge is answered.
+- `state: visual` — an image challenge is open. **You cannot solve this, and neither
+  can the browser yet.** Report it to the user instead of burning attempts.
+- `state: audio` — an audio challenge is open. This is the automatable route and it
+  is not wired up yet, so treat it like `visual` for now.
+
+Cloudflare Turnstile usually reaches `solved` from the click alone, so
+`ghost_captcha` can clear a Cloudflare interstitial on its own. hCaptcha and
+reCAPTCHA escalate, and the honest answer is that they stop there.
+
+Do not retry a challenge in a loop. Repeated attempts are themselves a bot signal,
+and a challenge that fails often comes back harder.
+
 ## What this browser deliberately cannot do
 
 - **There is no JavaScript evaluation**, over MCP or the pipe. Running script in

@@ -276,6 +276,47 @@ Returns `{"ok": true, "path": "...", "width": 1280, "height": 720}`. The file is
 **BMP**, written by capturing the window through the OS, so it shows exactly what
 was on screen including anything drawn outside the page.
 
+### `captcha`
+
+Reads the human-verification challenge on the page and, when asked, clicks it.
+
+| field | default | meaning |
+|---|---|---|
+| `action` | `solve` | `detect` reads only; `solve` also clicks the checkbox and watches |
+| `timeout` | `30000` | milliseconds to keep watching after the click |
+
+Returns `provider`, `state`, `detail`, and when they are known `site_key`, `page_url`,
+`frame_url` and `challenge_token`; `solve` adds `clicked` and `elapsed_ms`.
+
+`provider` is one of `none`, `hcaptcha`, `recaptcha`, `turnstile`. `state` is one of
+`absent`, `checkbox`, `visual`, `audio`, `solved`.
+
+Everything is read from the accessibility tree — the same tree `find` walks, which
+sees into the challenge's cross-origin iframe. A challenge frame's document node
+carries the frame's URL as its `value`, and the sitekey lives in that URL, so
+`site_key` is parsed out of it rather than guessed. `page_url` is the top-level
+document's URL. `challenge_token` is reCAPTCHA's `bft` parameter, which is what a
+solving service needs for an image challenge.
+
+`site_key` is empty for Cloudflare Turnstile: its widget document has no `value`, so
+the widget is recognized by name and automation id instead, and there is no URL to
+parse.
+
+What `solve` actually does: it clicks the checkbox once — twice if the first click
+changes nothing, because the widget animates in and a click aimed at a stale
+rectangle lands nowhere — then watches until the state settles:
+
+- `solved` — the widget is gone, so the challenge was answered. Turnstile usually
+  reaches this from the click alone.
+- `visual` — an image challenge is open. A person still has to solve it; this is
+  where the browser's job ends and yours begins.
+- `audio` — an audio challenge is open. This is the state the local speech-to-text
+  path is meant to act on.
+
+`absent` right after a click is not "there is no challenge": it is what Cloudflare
+looks like while it verifies, because the checkbox is gone while the widget is still
+there. The command keeps watching through it.
+
 ### `shutdown`
 
 Stops the server. If the server launched the browser (the normal case), it also

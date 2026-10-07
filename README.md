@@ -32,11 +32,14 @@ needed to work on the source or run the fingerprint test page under `harness/`.
 | WebGL vendor / renderer (`UNMASKED_*`) | **working** — via DXGI adapter identity |
 | Font enumeration (`document.fonts`, `measureText`) | **working** — DirectWrite collection filtered |
 | Zero-CDP control plane (`ghost serve`) | **working** — 19 checks |
+| Reading a human-verification challenge | **working** — 18 checks |
+| Clearing Cloudflare Turnstile | **working** — a trusted click answers it |
+| hCaptcha / reCAPTCHA image challenges | **read and opened, not solved** |
+| hCaptcha / reCAPTCHA audio challenges | **reachable, solver not wired up** |
 | Window branding (title, icon, taskbar) | **working** |
 | Reading cookies while the browser runs | **impossible** — Chrome holds the file unshared |
 | Fingerprint coherence harness | **34 checks, 0 failed** |
 | Canvas / Audio | **not spoofed** (Track A gap — no OS API to hook) |
-| Captcha pipeline (CF, hCaptcha) | **not implemented** |
 | Linux / macOS | **not implemented** |
 
 `python harness/run_detect.py --sandboxed --chrome-arg=--disable-gpu-sandbox` currently prints:
@@ -211,6 +214,39 @@ navigate → read → act → re-read loop, and the failure that otherwise looks
 synthesized input is silently discarded on a disconnected desktop session, so a click
 appears to do nothing. An MCP server alone leaves an agent to rediscover that every
 time.
+
+### Human-verification challenges
+
+The control plane's `captcha` command reads the challenge on the page and, with
+`action=solve` (the default), clicks it. It needs no CDP and no injected script, because
+the accessibility tree already sees inside
+the challenge's cross-origin iframe — and a challenge frame's document node carries its
+own URL as its `value`, which is where the sitekey lives:
+
+```bash
+ghost call '{"cmd":"captcha","action":"detect"}' --id agent
+```
+```json
+{"ok": true, "provider": "hcaptcha", "state": "checkbox",
+ "site_key": "a5f74b19-9e45-40e0-b45d-47ff91b7a6c2",
+ "page_url": "https://accounts.hcaptcha.com/demo",
+ "frame_url": "https://newassets.hcaptcha.com/captcha/v1/.../hcaptcha.html#frame=checkbox&id=...",
+ "detail": "the widget is showing its checkbox"}
+```
+
+Measured against the three real challenges (`python tools/captcha_check.py` → **18 checks,
+0 failed**):
+
+| Challenge | What the browser does |
+|---|---|
+| Cloudflare Turnstile | **solves it** — one trusted click, the widget goes |
+| hCaptcha | reads the sitekey, clicks, opens the image challenge |
+| reCAPTCHA v2 | reads the sitekey, clicks, opens the challenge; the audio challenge is reachable and its token is read |
+
+What is *not* done: solving the image challenge, and solving the audio one. The audio
+route is the automatable one — capture what the browser actually plays through a WASAPI
+loopback and transcribe it locally — and that is the next piece of work, alongside a
+third-party solving API for the cases where neither works.
 
 ### The window says "Ghost Browser"
 

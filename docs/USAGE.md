@@ -433,12 +433,64 @@ Correct and unavoidable. The log line `load_exit=0xC0000022` means
 `STATUS_ACCESS_DENIED` from a restricted token. Only the browser, GPU and
 utility processes are reachable.
 
-## 9. What is not implemented yet
+## 9. Human-verification challenges
+
+The `captcha` command on the control plane reads the challenge and, when it can,
+clears it. It works through the accessibility tree rather than the DOM, so there is
+no CDP involved and nothing is injected. Send it with `ghost call` to a session that
+is already running (`ghost serve --id work` in another window):
+
+```
+ghost call --id work "{\"cmd\":\"captcha\"}"                          # detect, then try to solve
+ghost call --id work "{\"cmd\":\"captcha\",\"action\":\"detect\"}"    # only report
+```
+
+A solved Cloudflare Turnstile looks like this:
+
+```json
+{
+  "provider": "turnstile",
+  "state": "solved",
+  "page_url": "https://nopecha.com/demo/cloudflare",
+  "detail": "the widget is gone"
+}
+```
+
+`state` is one of:
+
+| state | meaning | what to do |
+|---|---|---|
+| `absent` | no widget on the page, or one is mid-verification | nothing, or wait |
+| `checkbox` | a widget is showing its checkbox | click it — that is what `solve` does |
+| `visual` | an image challenge is open | **stop** — nothing here solves it |
+| `audio` | an audio challenge is open | **stop** — nothing here transcribes it yet |
+| `solved` | the widget is gone | continue |
+
+What actually happens today, measured against the three real challenges
+([`tools/captcha_check.py`](tools/captcha_check.py), **18 checks, 0 failed**):
+
+| challenge | result |
+|---|---|
+| Cloudflare Turnstile | **passes**, on one trusted click |
+| hCaptcha | sitekey read, checkbox clicked, image challenge opens |
+| reCAPTCHA v2 | sitekey read, checkbox clicked, image challenge opens; the audio button is reachable and opens the audio challenge |
+
+Two things are worth saying plainly. **A widget that is already there is not a
+failure** — Turnstile often passes with no visible challenge at all, and hCaptcha
+and reCAPTCHA only decide to escalate after you click. And **do not retry in a
+loop**: repeated attempts are themselves a bot signal and make things worse, not
+better. Ask once, report what you got, move on.
+
+From an agent the same thing is one MCP call — `ghost_captcha`.
+
+## 10. What is not implemented yet
 
 This is a vertical slice, not a finished product. Not built yet:
 
-- **No CAPTCHA solving.** The three-tier strategy (silent pass → local audio →
-  third-party API) is designed in `docs/ARCHITECTURE.md` §6, not implemented.
+- **No CAPTCHA solving beyond Turnstile.** Reading the challenge and clicking the
+  checkbox works (§9). Image challenges are not solved, audio challenges are not
+  transcribed, and the third-party API tier is not wired up. The plan is in
+  `docs/ARCHITECTURE.md` §14.
 - **Windows x64 only.** Linux and macOS are designed in §8 and not implemented.
 - **No canvas / audio / font-metric spoofing.** Canvas hashing, audio
   fingerprinting and font metrics are still measured from the real machine. See

@@ -211,7 +211,8 @@ def main() -> int:
         checks.true("tools/list returns tools", len(tools) >= 10)
         for required in ("ghost_open", "ghost_status", "ghost_navigate", "ghost_page",
                          "ghost_find", "ghost_click", "ghost_type", "ghost_key",
-                         "ghost_scroll", "ghost_screenshot", "ghost_close"):
+                         "ghost_scroll", "ghost_screenshot", "ghost_captcha",
+                         "ghost_close"):
             checks.true(f"tool {required} is offered", required in names)
         checks.true("every tool has an input schema",
                     all("inputSchema" in tool for tool in tools))
@@ -253,6 +254,15 @@ def main() -> int:
             head = (find_text.splitlines() or [""])[0].split()
             link_count = int(head[0]) if head and head[0].isdigit() else -1
             checks.true("ghost_find sees page links", link_count > 0, find_text[:300])
+
+            # example.com carries no human-verification widget, so the honest answer
+            # is "none" — not an error, and not a provider invented out of the page's
+            # own URL, which is the bug ARCHITECTURE.md §14.3 records.
+            result = client.call_tool("ghost_captcha", {"action": "detect"})
+            captcha_text = text_of(result)
+            checks.true("ghost_captcha runs", not result.get("isError"), captcha_text)
+            checks.contains("ghost_captcha finds no challenge on a plain page",
+                            captcha_text, "no human-verification challenge")
 
         # Screenshots work in any session, foreground or not.
         result = client.call_tool("ghost_screenshot")

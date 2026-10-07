@@ -79,12 +79,21 @@ but `ghost serve` does not exist there yet.
 | `ghost_type` | `text` | Type into the focused field |
 | `ghost_key` | `key` \| `keys[]` | Press a key or a combination |
 | `ghost_scroll` | `delta?`, `css_x?`, `css_y?` | Scroll |
+| `ghost_captcha` | `action?` (`detect`/`solve`), `timeout?` | Read and click a human-verification challenge |
 | `ghost_screenshot` | — | Capture the window as PNG |
 | `ghost_close` | — | Close the browser and stop the server |
 
 The intended loop is: `ghost_navigate` → `ghost_page` → `ghost_click` with an index
 from that page → `ghost_page` again to see what changed. `ghost_wait_for` covers the
 gap between an action and the content it loads.
+
+When a page is behind a human-verification challenge, call `ghost_captcha` instead of
+hunting for the checkbox yourself. It reads the challenge from the accessibility tree
+and returns the provider, the state and the sitekey; with `action="solve"` it clicks
+the checkbox and reports where that got you. Cloudflare Turnstile usually passes from
+that click alone. hCaptcha and reCAPTCHA escalate to an image or audio challenge,
+which the tool reports honestly rather than pretending to have solved — the audio
+route is the one that can be automated, and that is the next piece of work.
 
 ## Environment
 
