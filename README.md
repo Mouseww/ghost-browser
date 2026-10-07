@@ -34,10 +34,11 @@ needed to work on the source or run the fingerprint test page under `harness/`.
 | Zero-CDP control plane (`ghost serve`) | **working** — 19 checks |
 | Working with no foreground window | **working** — falls back to UI Automation and says which channel it used |
 | Reading a human-verification challenge | **working** — 33 checks |
+| Waiting for a challenge without touching it | **working** — `captcha action=wait` |
 | Clearing Cloudflare Turnstile | **working** — one click answers it |
 | hCaptcha / reCAPTCHA image challenges | **read and opened, not solved** |
 | reCAPTCHA audio challenge | **recorded, transcribed and answered** — locally, or by a service when no recogniser fits |
-| hCaptcha audio challenge | **not driven** — it goes through hCaptcha's accessibility menu |
+| hCaptcha audio challenge | **not driven** — a measured dead end: its menu button ignores UI Automation |
 | Window branding (title, icon, taskbar) | **working** |
 | Reading cookies while the browser runs | **impossible** — Chrome holds the file unshared |
 | Fingerprint coherence harness | **34 checks, 0 failed** |
