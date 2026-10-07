@@ -254,9 +254,9 @@ depend on the challenge's internal structure:
 ```json
 {"ok": true, "provider": "recaptcha", "state": "audio",
  "play": "pressed the challenge's play control",
- "device": "Speakers (Realtek)", "captured_seconds": 4.9,
- "peak": 0.4595, "streams": "pid 14752 active peak 0.0388",
- "solved_by": "api", "heard": "37194", "confidence": 1,
+ "device": "远程音频", "captured_seconds": 4.93,
+ "peak": 0.6771, "streams": "pid 20460 active peak 0.0409",
+ "solved_by": "api", "heard": "385124", "confidence": 1,
  "typed": true, "input": "synthesized", "solved": false}
 ```
 
