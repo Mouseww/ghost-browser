@@ -167,7 +167,7 @@ vtable 位于 `dxgi.dll`，patch 它**不需要任何 `chrome.dll` 符号逆向*
 1. **写隐藏表单字段。** 无障碍树能读，不能把任意值写进去。`g-recaptcha-response` 正是隐藏字段，第三方打码服务返回的 token 必须落到它里面，否则「解出来了」只是自说自话。
 2. **读 `<audio>` 元素自己的 URL。** 挑战音频的地址只有页面自己知道，无障碍树只给 role/name/value。
 
-因此 `control.mode = "cdp-pipe"` **自 0.10.0 起是默认档位**：用 `--remote-debugging-pipe`（匿名管道句柄，非 TCP 端口，页面无法做端口扫描，profile 里也不写 `DevToolsActivePort`）补上这两项，其余能力仍走原生通道。**`--no-cdp` 回到纯 `native` 档位**——此时上述两项确实不可用，这是取舍，不是缺陷。
+因此 `control.mode = "cdp-pipe"` **自 0.11.0 起是默认档位**：用 `--remote-debugging-pipe`（匿名管道句柄，非 TCP 端口，页面无法做端口扫描，profile 里也不写 `DevToolsActivePort`）补上这两项，其余能力仍走原生通道。**`--no-cdp` 回到纯 `native` 档位**——此时上述两项确实不可用，这是取舍，不是缺陷。
 
 打开该管道会连带打开 Blink 的 `AutomationControlled` 特性，把 `navigator.webdriver` 变成 `true`——恰好是这个项目最该避免的那件事。启动器在追加管道参数的同时**合并** `--disable-blink-features=AutomationControlled`（Chrome 只认一次该开关，所以要合并进调用方已有的那一个）。实测三种配置：管道开 → `true`；`--no-cdp` → `false`；管道开且手动加该开关 → `false`；修复后三者全部 `false`。
 
@@ -544,7 +544,7 @@ WebGL 从「必须重编引擎」降级为「Track A 即可」，大幅缩小了
 ### 12.8 DevTools 通道：默认开启，管道而非端口
 
 零 CDP 的承诺实测下来有两处**替代通道补不上**：隐藏表单字段写不进去，`<audio>` 元素
-自己的 URL 读不到。前者正好是第三方打码服务返回 token 的落点，所以自 0.10.0 起
+自己的 URL 读不到。前者正好是第三方打码服务返回 token 的落点，所以自 0.11.0 起
 `ghost` 默认打开 `--remote-debugging-pipe`：**句柄由启动器创建后传给子进程**
 （`--remote-debugging-io-pipes=<read>,<write>`，见 `native/ghost_cli/src/launch.cpp:60-97`
 的注释——`chrome_main_delegate.cc:1221-1233` 在 `--remote-debugging-pipe` 存在时会跳过

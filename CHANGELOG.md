@@ -5,7 +5,7 @@ All notable changes to this project are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.10.0] - 2026-10-09
+## [0.11.0] - 2026-10-09
 
 ### Added
 
@@ -37,39 +37,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`ghost call --cmd cdp` / the `ghost_cdp` MCP tool**, so a caller can send a
   DevTools method directly instead of waiting for a command to be written for it.
   `session: "browser"` addresses the browser; anything else is page-scoped.
-
-- **`captcha action=solve-audio` now answers multi-round challenges in one call.**
-  reCAPTCHA's audio challenge often rejects one correct answer and plays the next clip,
-  which used to end the command with a single-round `visual` and push the loop back to
-  the caller. A `rounds` parameter (default 1, clamped 1–5) now answers up to that many
-  clips per call: after a typed answer fails to clear the challenge, the command clicks
-  the reload control, re-reads the tree (a redraw invalidates indexes) and records the
-  next clip. Replies for `rounds > 1` add `rounds_attempted`; single-round replies keep
-  their previous shape. Accepted end-to-end against a stand-in service
-  (`tools/solve_api_check.py`): **12 checks, 0 failed** — upload still 16 kHz mono,
-  still polled, `solved_by: api`, digits still typed.
-- **The digit grammar now speaks the recognizer's language.** `digit_grammar_srgs`
-  hardcoded Chinese digit words (`零一二两三四五六七八九`) regardless of culture, so on a
-  machine with an English-only recognizer the local tier fed SAPI a word list it could
-  never match — `language=en` solve-audio would always fall through to the service even
-  though a local engine was installed. The grammar is now chosen by culture prefix:
-  `en` → `zero`..`nine`, `zh` → the Chinese list (with 两 kept beside 二), and an
-  unknown or missing culture falls back to literal `0`..`9`, which `digits_from` maps
-  back on any engine. On this machine (zh-CN recognizer only, no en-US recognizer) the
-  default path is unchanged; the fix removes the portability trap rather than a local
-  regression.
-- **The hCaptcha accessibility menu is reachable after all — by synthesized input.**
-  The 0.9.0 "measured dead end" recorded that invoking the menu button through UI
-  Automation changes nothing for ten seconds. A re-probe with a foreground-capable
-  session shows a synthesized (SendInput) click opens that menu in about one second
-  (tree grows 42 → 47 nodes). The menu holds four items — `可访问性：检索 Cookie`,
-  `向 hCaptcha 举报图片`, `向 hCaptcha 报告错误`, `关于 hCaptcha 的信息` — and none of
-  them is a solvable challenge in this build (cookie retrieval needs a cookie the
-  browser does not have; no text-challenge item is offered). So the route stays closed,
-  but by the menu's *content*, not by unreachability — and a future hCaptcha build that
-  ships a text challenge behind that button becomes reachable from a foreground session.
-  Docs corrected (`docs/USAGE.md`, `docs/ARCHITECTURE.md`) to scope the Invoke dead end
-  to no-foreground sessions only.
 - **Clicks to controls outside the window now bring the window to them.** On a
   low-resolution screen or a small restored window, a challenge dialog can be taller
   than the client area; its bottom controls (the audio button, the answer field) then
@@ -125,6 +92,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `webdriver=false`, and `serve_check.py`'s "no automation globals are visible to the
   page" check — which had been passing only because the page was unreadable — passes
   for the right reason.
+
+## [0.10.0] - 2026-10-08
+
+### Added
+
+- **`captcha action=solve-audio` now answers multi-round challenges in one call.**
+  reCAPTCHA's audio challenge often rejects one correct answer and plays the next clip,
+  which used to end the command with a single-round `visual` and push the loop back to
+  the caller. A `rounds` parameter (default 1, clamped 1–5) now answers up to that many
+  clips per call: after a typed answer fails to clear the challenge, the command clicks
+  the reload control, re-reads the tree (a redraw invalidates indexes) and records the
+  next clip. Replies for `rounds > 1` add `rounds_attempted`; single-round replies keep
+  their previous shape. Accepted end-to-end against a stand-in service
+  (`tools/solve_api_check.py`): **12 checks, 0 failed** — upload still 16 kHz mono,
+  still polled, `solved_by: api`, digits still typed.
+- **The digit grammar now speaks the recognizer's language.** `digit_grammar_srgs`
+  hardcoded Chinese digit words (`零一二两三四五六七八九`) regardless of culture, so on a
+  machine with an English-only recognizer the local tier fed SAPI a word list it could
+  never match — `language=en` solve-audio would always fall through to the service even
+  though a local engine was installed. The grammar is now chosen by culture prefix:
+  `en` → `zero`..`nine`, `zh` → the Chinese list (with 两 kept beside 二), and an
+  unknown or missing culture falls back to literal `0`..`9`, which `digits_from` maps
+  back on any engine. On this machine (zh-CN recognizer only, no en-US recognizer) the
+  default path is unchanged; the fix removes the portability trap rather than a local
+  regression.
+- **The hCaptcha accessibility menu is reachable after all — by synthesized input.**
+  The 0.9.0 "measured dead end" recorded that invoking the menu button through UI
+  Automation changes nothing for ten seconds. A re-probe with a foreground-capable
+  session shows a synthesized (SendInput) click opens that menu in about one second
+  (tree grows 42 → 47 nodes). The menu holds four items — `可访问性：检索 Cookie`,
+  `向 hCaptcha 举报图片`, `向 hCaptcha 报告错误`, `关于 hCaptcha 的信息` — and none of
+  them is a solvable challenge in this build (cookie retrieval needs a cookie the
+  browser does not have; no text-challenge item is offered). So the route stays closed,
+  but by the menu's *content*, not by unreachability — and a future hCaptcha build that
+  ships a text challenge behind that button becomes reachable from a foreground session.
+  Docs corrected (`docs/USAGE.md`, `docs/ARCHITECTURE.md`) to scope the Invoke dead end
+  to no-foreground sessions only.
 
 ## [0.9.0] - 2026-10-07
 
