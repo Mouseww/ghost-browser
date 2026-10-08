@@ -42,6 +42,15 @@ struct LaunchOptions {
   // open for as long as the browser runs — `ghost browse | anything` would never
   // finish. Long-lived targets therefore get no inherited handles.
   bool forward_stdio = true;
+
+  // When set, the launcher creates two anonymous pipes, gives the child ends to
+  // the browser on its command line, and returns the parent ends through the
+  // pointers below. Chrome then speaks DevTools over those pipes, so there is no
+  // listening socket and no DevToolsActivePort file in the profile. The caller
+  // owns both returned handles and must close them.
+  bool cdp = false;
+  HANDLE* cdp_read_out = nullptr;   // what the browser writes
+  HANDLE* cdp_write_out = nullptr;  // what the browser reads
 };
 
 // Returns the target's exit code. Codes 1-3 are the launcher's own failures:

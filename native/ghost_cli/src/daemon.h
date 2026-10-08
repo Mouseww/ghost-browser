@@ -25,6 +25,11 @@ struct ServeOptions {
   std::vector<std::string> urls;
   DWORD attach_pid = 0;  // non-zero: drive an already-running browser
   bool sandbox = false;
+  // DevTools over anonymous pipes, on by default. It costs nothing a page can
+  // see -- no port, no file in the profile -- and it is the only way to reach the
+  // parts of a challenge that are not in the accessibility tree. `--no-cdp`
+  // turns it off for callers who would rather have no debugging channel at all.
+  bool cdp = true;
   bool verbose = false;
 };
 

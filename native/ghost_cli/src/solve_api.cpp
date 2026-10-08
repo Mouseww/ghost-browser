@@ -136,6 +136,58 @@ std::string trimmed(const std::string& text) {
   return text.substr(begin, end - begin);
 }
 
+// Submits one job and polls until the service answers. Both tiers differ only in
+// what they ask for and what they do with the reply, so the two calls that make
+// up the protocol live here once.
+bool submit_and_poll(const SolveApi& api, const std::string& body, std::string* answer,
+                     std::string* error) {
+  std::string reply;
+  if (!http_request("POST", api.base_url + "/in.php", body,
+                    "application/x-www-form-urlencoded", &reply, error)) {
+    return false;
+  }
+  reply = trimmed(reply);
+  if (reply.rfind("OK|", 0) != 0) {
+    if (error != nullptr) *error = "the service refused the request: " + reply;
+    return false;
+  }
+  const std::string id = reply.substr(3);
+
+  // The service answers when it has an answer, and there is no way to ask sooner
+  // that is not simply polling. Two minutes is generous for one challenge and
+  // still short enough that a caller is not left hanging on a dead request.
+  const ULONGLONG deadline = ::GetTickCount64() + 120000;
+  while (::GetTickCount64() < deadline) {
+    ::Sleep(5000);
+    const std::string poll = api.base_url + "/res.php?key=" + url_encode(api.key) +
+                             "&action=get&id=" + url_encode(id);
+    std::string polled;
+    if (!http_request("GET", poll, std::string(), std::string(), &polled, error)) {
+      return false;
+    }
+    polled = trimmed(polled);
+    if (polled.rfind("OK|", 0) == 0) {
+      *answer = polled.substr(3);
+      return true;
+    }
+    if (polled.find("CAPCHA_NOT_READY") != std::string::npos) continue;
+    if (error != nullptr) *error = "the service failed: " + polled;
+    return false;
+  }
+  if (error != nullptr) *error = "the service did not answer within two minutes";
+  return false;
+}
+
+bool tier_configured(const SolveApi& api, std::string* error) {
+  if (!api.provider.empty() && !api.key.empty()) return true;
+  if (error != nullptr) {
+    *error =
+        "no solving service is configured: set GHOST_CAPTCHA_KEY, or add "
+        "\"captcha_api_key\" to the profile";
+  }
+  return false;
+}
+
 }  // namespace
 
 std::string base64_encode(const unsigned char* data, size_t size) {
@@ -193,14 +245,7 @@ SolveApi resolve_solve_api(const std::string& explicit_key,
 bool solve_audio_api(const SolveApi& api, const std::string& wav_path,
                      const std::string& language, std::string* digits,
                      std::string* error) {
-  if (api.provider.empty() || api.key.empty()) {
-    if (error != nullptr) {
-      *error =
-          "no solving service is configured: set GHOST_CAPTCHA_KEY, or add "
-          "\"captcha_api_key\" to the profile";
-    }
-    return false;
-  }
+  if (!tier_configured(api, error)) return false;
   const std::string audio = read_file(wav_path);
   if (audio.empty()) {
     if (error != nullptr) *error = "could not read the recording at " + wav_path;
@@ -214,47 +259,39 @@ bool solve_audio_api(const SolveApi& api, const std::string& wav_path,
   if (!language.empty()) body += "&language=" + url_encode(language);
 
   std::string answer;
-  if (!http_request("POST", api.base_url + "/in.php", body,
-                    "application/x-www-form-urlencoded", &answer, error)) {
+  if (!submit_and_poll(api, body, &answer, error)) return false;
+  const std::string heard = digits_from(answer);
+  if (heard.empty()) {
+    if (error != nullptr) *error = "the service answered without digits: " + answer;
     return false;
   }
-  answer = trimmed(answer);
-  if (answer.rfind("OK|", 0) != 0) {
-    if (error != nullptr) *error = "the service refused the recording: " + answer;
-    return false;
-  }
-  const std::string id = answer.substr(3);
+  if (digits != nullptr) *digits = heard;
+  return true;
+}
 
-  // The service answers when it has an answer, and there is no way to ask sooner
-  // that is not simply polling. Two minutes is generous for a short recording and
-  // still short enough that a caller is not left hanging on a dead request.
-  const ULONGLONG deadline = ::GetTickCount64() + 120000;
-  while (::GetTickCount64() < deadline) {
-    ::Sleep(5000);
-    const std::string poll = api.base_url + "/res.php?key=" + url_encode(api.key) +
-                             "&action=get&id=" + url_encode(id);
-    std::string reply;
-    if (!http_request("GET", poll, std::string(), std::string(), &reply, error)) {
-      return false;
-    }
-    reply = trimmed(reply);
-    if (reply.rfind("OK|", 0) == 0) {
-      const std::string heard = digits_from(reply.substr(3));
-      if (heard.empty()) {
-        if (error != nullptr) {
-          *error = "the service answered without digits: " + reply.substr(3);
-        }
-        return false;
-      }
-      if (digits != nullptr) *digits = heard;
-      return true;
-    }
-    if (reply.find("CAPCHA_NOT_READY") != std::string::npos) continue;
-    if (error != nullptr) *error = "the service failed: " + reply;
+bool solve_recaptcha_api(const SolveApi& api, const std::string& site_key,
+                         const std::string& page_url, std::string* token,
+                         std::string* error) {
+  if (!tier_configured(api, error)) return false;
+  if (site_key.empty()) {
+    if (error != nullptr) *error = "there is no site key to solve for";
     return false;
   }
-  if (error != nullptr) *error = "the service did not answer within two minutes";
-  return false;
+
+  // The classic reCAPTCHA v2 job: the widget's key and the page it sits on are
+  // the whole question, because the service reproduces the challenge itself
+  // rather than being handed a picture of it.
+  const std::string body = "key=" + url_encode(api.key) +
+                           "&method=userrecaptcha&googlekey=" + url_encode(site_key) +
+                           "&pageurl=" + url_encode(page_url);
+  std::string answer;
+  if (!submit_and_poll(api, body, &answer, error)) return false;
+  if (answer.empty()) {
+    if (error != nullptr) *error = "the service returned an empty token";
+    return false;
+  }
+  if (token != nullptr) *token = answer;
+  return true;
 }
 
 }  // namespace ghost

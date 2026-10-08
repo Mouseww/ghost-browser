@@ -38,8 +38,8 @@ file(TO_CMAKE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/assets/ghost.ico" GHOST_ICON_PAT
 
 # One version string for every artifact, so the shim and the launcher cannot
 # disagree about which build is running.
-set(GHOST_VERSION 0.9.0)
-set(GHOST_VERSION_COMMA 0,9,0,0)
+set(GHOST_VERSION 0.10.0)
+set(GHOST_VERSION_COMMA 0,10,0,0)
 
 # ---------------------------------------------------------------------------
 # ghost_shim — the injected native layer
@@ -108,6 +108,7 @@ add_executable(ghost
   ghost_cli/src/captcha.cpp
   ghost_cli/src/audio_capture.cpp
   ghost_cli/src/speech.cpp
+  ghost_cli/src/cdp.cpp
   ghost_cli/src/solve_api.cpp
   common/probe_report.cpp
   "${CMAKE_CURRENT_BINARY_DIR}/ghost.rc")

@@ -128,12 +128,29 @@ adapter spoofing work; the renderer sandbox is unaffected.
 `run` is the escape hatch: same injection machinery, no browser discovery. The
 target's output is forwarded to your console.
 
-## 4. Drive it from a program, without CDP
+## 4. Drive it from a program
 
 `ghost serve` runs the browser behind a JSON control plane. The transport is a
 **named pipe** (`\\.\pipe\ghost-<id>`), never a TCP port, because a page can scan
-ports and cannot scan pipes. There is no `--remote-debugging-port`, no
-`Runtime.enable`, no injected utility script, and no `navigator.webdriver`.
+ports and cannot scan pipes.
+
+Two channels reach the browser, and it is worth keeping them apart:
+
+- **The control plane** — the pipe above — is how *you* send commands. It is the
+  only transport this project invented, and the page cannot see it.
+- **The DevTools channel** is how `ghost` itself reads and writes the page when a
+  command needs it to. It is a second, anonymous pipe (`--remote-debugging-pipe`
+  over handles the launcher creates and hands to the child), so there is still no
+  `--remote-debugging-port` for a page to scan and no `DevToolsActivePort` file in
+  the profile. It is driven with `Runtime.evaluate`, which needs no `Runtime.enable`
+  — that call changes the console object from inside the page, and is one of the
+  standard ways a page notices DevTools. Nothing is injected that runs before the
+  page's own code. `--no-cdp` closes the channel; page reading then falls back to
+  the accessibility tree and input to OS synthesis.
+
+`navigator.webdriver` is `false` either way. Opening the DevTools pipe switches on
+Blink's `AutomationControlled` feature, which would otherwise set it to `true`, so
+the launcher disables that feature together with the pipe that needs it.
 
 ```powershell
 .\ghost.exe serve --id demo --pipe demo --tz Europe/London --locale en-GB https://example.com
@@ -445,6 +462,7 @@ ghost call --id work "{\"cmd\":\"captcha\"}"                          # detect, 
 ghost call --id work "{\"cmd\":\"captcha\",\"action\":\"detect\"}"    # only report
 ghost call --id work "{\"cmd\":\"captcha\",\"action\":\"wait\",\"timeout\":30000}"
 ghost call --id work "{\"cmd\":\"captcha\",\"action\":\"solve-audio\",\"language\":\"en-US\"}"
+ghost call --id work "{\"cmd\":\"captcha\",\"action\":\"solve-token\"}"   # needs a service key
 ```
 
 **One look is not a detection.** The widget animates in, and the gap is not subtle: on
@@ -487,7 +505,7 @@ A solved Cloudflare Turnstile looks like this:
 |---|---|---|
 | `absent` | no widget on the page, or one is mid-verification | nothing, or wait |
 | `checkbox` | a widget is showing its checkbox | click it — that is what `solve` does |
-| `visual` | an image challenge is open | **stop** — nothing here solves it |
+| `visual` | an image challenge is open | a person, or `action=solve-token` with a service key — see below |
 | `audio` | an audio challenge is open | `action=solve-audio` records it and types the answer |
 | `solved` | the widget is gone | continue |
 
@@ -607,18 +625,58 @@ answered is itself a failure.)
 From an agent the same thing is one MCP call — `ghost_captcha`, with
 `action="solve-audio"` for the audio route.
 
+### Answering an image challenge with a service
+
+An image grid is the one challenge that cannot be read out of the accessibility tree
+*and* cannot be answered by typing. `action=solve-token` takes a different route that
+never looks at the picture: a solving service rebuilds the challenge itself from the
+site key and the page URL, and hands back the signed token the widget would have
+produced. The hard part was never the classification — it was the last step, because
+that token has to be written into a hidden `g-recaptcha-response` field, and a hidden
+field is not in the accessibility tree. That is now a DOM write.
+
+```json
+{
+  "provider": "recaptcha",
+  "state": "visual",
+  "site_key": "6Le-wvkSAAAAAPBMRTvw0Q4Muexq9bi0DJwx_mJ-",
+  "page_url": "https://www.google.com/recaptcha/api2/demo",
+  "kind": "recaptcha",
+  "response_field": true,
+  "fields_filled": 1,
+  "callback_called": true,
+  "submitted": "form",
+  "solved_by": "api"
+}
+```
+
+It fails loudly instead of claiming success. With no site key on the page it says
+`the page carries no site key to solve for`; with no service configured it says
+`no solving service is configured: set GHOST_CAPTCHA_KEY, or add "captcha_api_key" to
+the profile`; and if the token reached no field it says `the page has no response field
+to receive the token; the widget may not have finished loading`. **`fields_filled: 0` is
+never reported as solved** — a token nobody received is not an answer.
+
+This action needs the DevTools channel, because that is what makes a DOM write possible.
+Under `--no-cdp` it cannot run at all.
+
+Its acceptance ([`tools/token_check.py`](tools/token_check.py)) points
+`GHOST_CAPTCHA_URL` at a stand-in service and loads a stand-in page, then checks the
+request shape (`method=userrecaptcha`, `googlekey`, `pageurl`), the polling past a
+not-ready answer, the write into the hidden field, the page's own callback, and the
+submitted form. It scores **12 checks, 0 failed**. What it deliberately does not test is
+the vendor's answer quality — that is the vendor's business, and there is no key in this
+repository.
+
 ## 10. What is not implemented yet
 
 This is a vertical slice, not a finished product. Not built yet:
 
-- **Image challenges are not solved, for an architectural reason rather than an
-  unfinished one.** A solving service can classify a picture grid, but reCAPTCHA-style
-  flows end with the service handing back a token that the *page* writes into a hidden
-  `g-recaptcha-response` field — and that step needs DOM access. The only channel this
-  browser has into a page is the accessibility tree, and hidden controls are not in it,
-  so the token would be obtainable but undeliverable. The audio route works precisely
-  because its answer is ordinary typing. Reading the challenge and clicking the checkbox
-  works, and audio challenges are recorded, transcribed and answered (§9).
+- **Image challenges are answered by a service, not by this browser.** `solve-token`
+  (§9) hands an image challenge to a solving service and delivers the resulting token,
+  which is a real answer — but the browser contributes the site key, the page URL, the
+  DOM write and the submit, and nothing else. There is no local image understanding here
+  and there is not going to be one; the vendor's accuracy is the vendor's.
 - **hCaptcha's audio route is not driven, and that is a measured dead end rather than
   an oversight.** The challenge frame does expose a button named `About hCaptcha &
   Accessibility Options` (with no automation id), and hCaptcha's own image alt text
@@ -645,6 +703,12 @@ This is a vertical slice, not a finished product. Not built yet:
   they are compiled into the engine: `chrome://version`, the on-disk file name
   `chrome.exe`, and the window class `Chrome_WidgetWin_1`. Only a source-level
   build (Track B) can fix them.
-- **No CDP escape hatch.** `control.mode = "cdp-pipe"` is designed in
-  `docs/ARCHITECTURE.md` §4.3 as a fallback for tools that need the protocol, and
-  is not wired up. It would use `--remote-debugging-pipe`, never a TCP port.
+- **The DevTools channel is on by default.** `control.mode = "cdp-pipe"` in
+  `docs/ARCHITECTURE.md` §4.3 is no longer a design sketch; it is what `--no-cdp`
+  turns off. It uses `--remote-debugging-pipe`, never a TCP port, and writes no
+  `DevToolsActivePort` file. What it does **not** claim is that the browser is
+  invisible to a page that is specifically looking for a DevTools client:
+  `Runtime.evaluate` is still an evaluation in the page's own world. The reason it
+  is on by default is narrower and concrete — two things were *impossible* without
+  it: a hidden form field cannot be written to, and an `<audio>` element's own URL
+  cannot be read. `--no-cdp` gives up exactly those two abilities and keeps the rest.

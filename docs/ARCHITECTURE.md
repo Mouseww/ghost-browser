@@ -103,8 +103,10 @@ vtable 位于 `dxgi.dll`，patch 它**不需要任何 `chrome.dll` 符号逆向*
 
 对剥离符号的二进制做**字符串常量与简单指令模式**补丁，不依赖符号表：
 
-- `--enable-automation` 相关分支（`navigator.webdriver` 的真实来源）
-- `AutomationControlled` Blink runtime feature 默认值
+- `--enable-automation` 相关分支（`navigator.webdriver` 的**来源之一**）
+- `AutomationControlled` Blink runtime feature 默认值（**另一个来源**；实测只要打开
+  `--remote-debugging-pipe` 就会打开它，现行做法是用
+  `--disable-blink-features=AutomationControlled` 抵消，见 §4.3）
 - UA 产品串 / 品牌串常量
 - 自动化提示条（infobar）资源
 - 版本/品牌元数据
@@ -137,7 +139,7 @@ vtable 位于 `dxgi.dll`，patch 它**不需要任何 `chrome.dll` 符号逆向*
 
 ---
 
-## 4. L3 控制面 — 零 CDP 的可行性
+## 4. L3 控制面 — 管道而非端口
 
 ### 4.1 为什么 CDP 是最大检测面
 
@@ -145,7 +147,7 @@ vtable 位于 `dxgi.dll`，patch 它**不需要任何 `chrome.dll` 符号逆向*
 1. **`--remote-debugging-port` 端口可被页面扫描**（Cloudflare 会探测 localhost 常见调试端口）
 2. `Runtime.enable` 对 V8 的副作用（序列化路径、console 上下文）
 3. Puppeteer/Playwright 注入的 `__playwright__binding__` / utility script（本架构天然不存在）
-4. `--enable-automation` → `navigator.webdriver`（本架构不设置该 flag）
+4. `--enable-automation` → `navigator.webdriver`（本架构不设置该 flag）。**但这不是唯一来源**：实测只要打开 `--remote-debugging-pipe`，Blink 的 `AutomationControlled` 特性就被打开，页面读到的 `navigator.webdriver` 同样是 `true`（见 §4.3）
 
 ### 4.2 零 CDP 的四个替代能力
 
@@ -160,7 +162,25 @@ vtable 位于 `dxgi.dll`，patch 它**不需要任何 `chrome.dll` 符号逆向*
 
 ### 4.3 权衡
 
-零 CDP 的代价是**实现量大**且无障碍树对复杂 SPA 有信息损失。为此保留一个**降级档位** `control.mode = "cdp-pipe"`：仅在用户显式选择时启用 `--remote-debugging-pipe`（非 TCP 端口，不可被页面端口扫描探测）作为兜底。**默认档位为 `native`。**
+零 CDP 的代价是**实现量大**且无障碍树对复杂 SPA 有信息损失。实测下来，这个代价里有两项是**替代通道根本补不上的**：
+
+1. **写隐藏表单字段。** 无障碍树能读，不能把任意值写进去。`g-recaptcha-response` 正是隐藏字段，第三方打码服务返回的 token 必须落到它里面，否则「解出来了」只是自说自话。
+2. **读 `<audio>` 元素自己的 URL。** 挑战音频的地址只有页面自己知道，无障碍树只给 role/name/value。
+
+因此 `control.mode = "cdp-pipe"` **自 0.10.0 起是默认档位**：用 `--remote-debugging-pipe`（匿名管道句柄，非 TCP 端口，页面无法做端口扫描，profile 里也不写 `DevToolsActivePort`）补上这两项，其余能力仍走原生通道。**`--no-cdp` 回到纯 `native` 档位**——此时上述两项确实不可用，这是取舍，不是缺陷。
+
+打开该管道会连带打开 Blink 的 `AutomationControlled` 特性，把 `navigator.webdriver` 变成 `true`——恰好是这个项目最该避免的那件事。启动器在追加管道参数的同时**合并** `--disable-blink-features=AutomationControlled`（Chrome 只认一次该开关，所以要合并进调用方已有的那一个）。实测三种配置：管道开 → `true`；`--no-cdp` → `false`；管道开且手动加该开关 → `false`；修复后三者全部 `false`。
+
+### 4.4 渲染进程被标记为 hidden 时，无障碍树与 CDP 输入会一起失效
+
+在**无法投递输入**的会话里（断开的 RDP、无头会话，`GetForegroundWindow()` 返回 0），Chromium 把渲染进程标记为 hidden。这一个条件会造成两个看起来毫不相干的故障：
+
+- **无障碍树不构建**：`tree` 只返回浏览器 chrome（实测 44 行、`primed no`），`find` 一个都匹配不到。
+- **CDP `Input.*` 被静默丢弃**：原始回复是 `{}`（没有错误），但一个事件都没到渲染进程。
+
+孤立验证（同一页面，**中间不发生任何导航**，只改一个变量）：发一次 `Emulation.setFocusEmulationEnabled {"enabled": true}`，`document.visibilityState` 由 `hidden` 变 `visible`，`ghost __uia` 由 44 行涨到 **71 行、`primed yes`**，树里出现 `document id=RootWebArea "Example Domain"` 与页面自己的 `link "Learn more"`；此时用 CDP 点击该链接真的导航了。
+
+修法是 `repair_hidden_renderer()`：在会话启动时、**第一次 `tree` 之前**调用（树是渲染进程**得知自己可见**时构建的，不是客户端索取时才建），并且仅在 `GetForegroundWindow() == nullptr` **且**页面自报 `hidden` 时才发那一条命令。理由是：在真实用户正看着浏览器的机器上强制 focus emulation，会让页面永远收不到 blur，那是另一种异常。
 
 ---
 
@@ -452,7 +472,8 @@ WebGL 从「必须重编引擎」降级为「Track A 即可」，大幅缩小了
 ## 12. L3 控制面已落地 — 命名管道 + UIA + SendInput
 
 §4 设计的东西已经实现，作为 `ghost.exe` 的 `serve` 模式（不是独立的 Rust daemon）。
-验收：`python tools/serve_check.py` → **17 checks, 0 failed**。
+验收：`python tools/serve_check.py` → **19 checks, 0 failed**（另有 7 项因本会话没有前台
+窗口而记为 not measurable，而不是 failed）。
 
 ### 12.1 为什么不写独立 daemon
 
@@ -518,7 +539,27 @@ WebGL 从「必须重编引擎」降级为「Track A 即可」，大幅缩小了
 
 ### 12.7 仍未做
 
-行为引擎（§7）、验证码（§6）、Linux/macOS（§8）都还没有实现。
+行为引擎（§7）、Linux/macOS（§8）还没有实现。验证码不是「未做」——见 §14，已做到三级。
+
+### 12.8 DevTools 通道：默认开启，管道而非端口
+
+零 CDP 的承诺实测下来有两处**替代通道补不上**：隐藏表单字段写不进去，`<audio>` 元素
+自己的 URL 读不到。前者正好是第三方打码服务返回 token 的落点，所以自 0.10.0 起
+`ghost` 默认打开 `--remote-debugging-pipe`：**句柄由启动器创建后传给子进程**
+（`--remote-debugging-io-pipes=<read>,<write>`，见 `native/ghost_cli/src/launch.cpp:60-97`
+的注释——`chrome_main_delegate.cc:1221-1233` 在 `--remote-debugging-pipe` 存在时会跳过
+描述符检查），所以：
+
+- **没有 TCP 端口**可被页面扫描；
+- **profile 里不写 `DevToolsActivePort`**（实测：整个 profile 目录递归查找无 `DevTools*` 文件）；
+- 只用 `Runtime.evaluate`，**不调 `Runtime.enable`**。
+
+代价与修法：打开该管道会连带打开 Blink 的 `AutomationControlled` 特性，把
+`navigator.webdriver` 变成 `true`。启动器把 `AutomationControlled` **合并进**调用方已有的
+`--disable-blink-features=`（Chrome 只认一次该开关）。三种配置实测：管道开 → `true`、
+`--no-cdp` → `false`、管道开 + 手动加该开关 → `false`；修复后全部 `false`。
+
+`--no-cdp` 回到纯原生档位，上述两项能力随之不可用——这是取舍，不是缺陷。
 
 ## 13. 字体通道 — DirectWrite 是 Track A 唯一还剩的可达指纹面
 

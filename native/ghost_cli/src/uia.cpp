@@ -59,6 +59,42 @@ void ensure_com() {
   }
 }
 
+// A client that is merely *alive* is not a client that is *listening*: the flag
+// Chromium reads is set when a client registers for events, not when it asks a
+// question. This is the smallest event sink that can exist -- it does nothing
+// with the events it receives, and exists only so that the registration, which
+// is the part that matters, actually happens.
+class StructureWatcher : public IUIAutomationStructureChangedEventHandler {
+ public:
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override {
+    if (out == nullptr) return E_POINTER;
+    if (iid == IID_IUnknown ||
+        iid == __uuidof(IUIAutomationStructureChangedEventHandler)) {
+      *out = static_cast<IUIAutomationStructureChangedEventHandler*>(this);
+      AddRef();
+      return S_OK;
+    }
+    *out = nullptr;
+    return E_NOINTERFACE;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override {
+    return static_cast<ULONG>(InterlockedIncrement(&refs_));
+  }
+  ULONG STDMETHODCALLTYPE Release() override {
+    const LONG left = InterlockedDecrement(&refs_);
+    if (left == 0) delete this;
+    return static_cast<ULONG>(left);
+  }
+  HRESULT STDMETHODCALLTYPE HandleStructureChangedEvent(IUIAutomationElement*,
+                                                        StructureChangeType,
+                                                        SAFEARRAY*) override {
+    return S_OK;
+  }
+
+ private:
+  LONG refs_ = 1;
+};
+
 std::string from_bstr(BSTR value) {
   if (value == nullptr) return std::string();
   return narrow(std::wstring(value, SysStringLen(value)));
@@ -421,6 +457,63 @@ std::vector<Element> find_elements(HWND window, const std::string& role,
   return walk_window(window, max_depth, max_nodes, false, role, name_contains, error);
 }
 
+// Every descendant the tree admits to having, with no view walker in the way.
+//
+// Chromium's control view is meant to hide nothing a caller would want, so this
+// is normally the same list as dump_tree. It exists for the case where it is
+// not: "the page is not exposed" and "the walker will not descend into it"
+// produce the same short list, and only a different question separates them.
+// Depth is deliberately left at zero -- this answers "is it there", not "where".
+std::vector<Element> dump_descendants(HWND window, int max_nodes, std::string* error) {
+  std::vector<Element> out;
+  error->clear();
+  if (window == nullptr || !IsWindow(window)) {
+    *error = "no such window";
+    return out;
+  }
+  if (max_nodes <= 0) max_nodes = 4000;
+
+  ensure_com();
+
+  Com<IUIAutomation> automation;
+  HRESULT hr = CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(automation.put()));
+  if (FAILED(hr)) {
+    *error = "UI Automation is unavailable (CoCreateInstance failed)";
+    return out;
+  }
+
+  Com<IUIAutomationElement> root;
+  hr = automation->ElementFromHandle(window, root.put());
+  if (FAILED(hr) || !root) {
+    *error = "UI Automation could not attach to the window";
+    return out;
+  }
+
+  Com<IUIAutomationCondition> condition;
+  hr = automation->CreateTrueCondition(condition.put());
+  if (FAILED(hr) || !condition) {
+    *error = "UI Automation has no true condition";
+    return out;
+  }
+
+  Com<IUIAutomationElementArray> found;
+  hr = root->FindAll(TreeScope_Descendants, condition.get(), found.put());
+  if (FAILED(hr) || !found) {
+    *error = "UI Automation could not enumerate the tree";
+    return out;
+  }
+
+  int count = 0;
+  found->get_Length(&count);
+  for (int i = 0; i < count && static_cast<int>(out.size()) < max_nodes; ++i) {
+    Com<IUIAutomationElement> element;
+    if (FAILED(found->GetElement(i, element.put())) || !element) continue;
+    out.push_back(describe(element.get()));
+  }
+  return out;
+}
+
 bool prime_accessibility(HWND window, int timeout_ms) {
   if (window == nullptr || !IsWindow(window)) return false;
   if (timeout_ms <= 0) timeout_ms = 3000;
@@ -442,6 +535,58 @@ bool prime_accessibility(HWND window, int timeout_ms) {
     if (GetTickCount64() >= deadline) return false;
     Sleep(120);
   }
+}
+
+// Holds a UI Automation client open, then reports what the platform believes.
+//
+// The flag this leaves behind belongs to the process, not to the query: it is
+// set while a client is alive and cleared when the last one goes away. A reading
+// taken inside a client that is about to exit therefore says nothing about what
+// a browser saw while it was starting -- only a client that stays alive can.
+// Sleeping here is the entire point of the function.
+bool hold_accessibility_client(int seconds, bool* clients_listening) {
+  if (clients_listening != nullptr) *clients_listening = false;
+  if (seconds <= 0) seconds = 1;
+
+  ensure_com();
+
+  Com<IUIAutomation> automation;
+  const HRESULT hr = CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER,
+                                      IID_PPV_ARGS(automation.put()));
+  if (FAILED(hr) || !automation) return false;
+
+  using ListeningFn = BOOL(WINAPI*)();
+  const HMODULE core = LoadLibraryW(L"uiautomationcore.dll");
+  const ListeningFn listening =
+      core == nullptr
+          ? nullptr
+          : reinterpret_cast<ListeningFn>(GetProcAddress(core, "UiaClientsAreListening"));
+
+  // An element query registers this process as a client; an event registration
+  // is what registers it as a *listener*. The desktop root is the cheapest
+  // element that always exists and covers every window on the session.
+  Com<IUIAutomationElement> desktop;
+  automation->GetRootElement(desktop.put());
+
+  StructureWatcher* watcher = new StructureWatcher();
+  const HRESULT added = automation->AddStructureChangedEventHandler(
+      desktop.get(), TreeScope_Subtree, nullptr,
+      static_cast<IUIAutomationStructureChangedEventHandler*>(watcher));
+
+  if (clients_listening != nullptr && listening != nullptr) {
+    *clients_listening = listening() != FALSE;
+  }
+
+  const ULONGLONG deadline = GetTickCount64() + static_cast<ULONGLONG>(seconds) * 1000;
+  while (GetTickCount64() < deadline) Sleep(100);
+
+  if (SUCCEEDED(added)) {
+    automation->RemoveStructureChangedEventHandler(
+        desktop.get(),
+        static_cast<IUIAutomationStructureChangedEventHandler*>(watcher));
+  }
+  watcher->Release();
+  return true;
 }
 
 bool element_center(const Element& element, int* x, int* y) {

@@ -27,10 +27,12 @@
 #include "launch.h"
 #include "pipe.h"
 #include "profile_gen.h"
+#include "uia.h"
+#include "window.h"
 
 namespace {
 
-constexpr const char* kVersion = "0.9.0";
+constexpr const char* kVersion = "0.10.0";
 constexpr const char* kDefaultId = "default";
 
 void print_usage() {
@@ -63,6 +65,7 @@ void print_usage() {
       "  --pipe <name>        control pipe name (default: ghost-<profile id>)\n"
       "  --attach <pid>       drive an already-running browser instead of launching one\n"
       "  --sandbox            keep Chromium's sandbox; renderer surfaces stay real\n"
+      "  --no-cdp             do not open a DevTools channel at all\n"
       "  --no-wait            return as soon as the browser is running\n"
       "  --allow-unspoofed    start the target even if injection fails\n"
       "  --force              overwrite an existing profile\n"
@@ -94,8 +97,11 @@ struct Options {
   bool wait = true;
   bool allow_unspoofed = false;
   bool sandbox = false;
+  bool no_cdp = false;
   bool force = false;
   bool digits = false;
+  bool subtree = false;
+  int hold = 0;
 };
 
 bool has_prefix(const std::string& s, const char* prefix) {
@@ -169,10 +175,16 @@ Options parse(const std::vector<std::string>& args) {
       o.allow_unspoofed = true;
     } else if (a == "--sandbox") {
       o.sandbox = true;
+    } else if (a == "--no-cdp") {
+      o.no_cdp = true;
     } else if (a == "--force") {
       o.force = true;
     } else if (a == "--digits") {
       o.digits = true;
+    } else if (a == "--subtree") {
+      o.subtree = true;
+    } else if (value_of(args, &i, "--hold", &v)) {
+      o.hold = std::atoi(v.c_str());
     } else if (a == "--help" || a == "-h") {
       o.command = "help";
     } else if (a == "--version") {
@@ -640,6 +652,8 @@ int cmd_probe(const Options& o) {
 //   ghost __speech list         which languages this machine can transcribe
 //   ghost __speech out.wav en   transcribe it, keeping only the digits
 //   ghost __speech out.wav en --digits   ...listening for digits and nothing else
+//   ghost __uia 12345           dump the accessibility tree of that process's window
+//   ghost __uia "Example"       ...matched by a piece of the window title instead
 //
 // It reports the level rather than just "ok", because the interesting failure is
 // not "the endpoint would not open" -- that comes back as an error -- but "it
@@ -756,6 +770,119 @@ int cmd_speech(const Options& o) {
   return 0;
 }
 
+// A window, a depth, and nothing else.
+//
+// This exists because "the accessibility tree stops at the browser chrome" has
+// two very different causes -- the page really is not exposed to UIA, or the
+// walk that reads it is broken -- and from inside the control plane those look
+// identical. Pointing the same walker at ANY window, including one this tool
+// never launched and never injected, is what tells the two apart.
+int cmd_uia(const Options& o) {
+  // The arguments are positional, so they are separated from the switches before
+  // anything reads them: a window subject, then an optional depth and cap.
+  const bool subtree = o.subtree;
+
+  // Held open before anything else, because the flag it sets is read by whatever
+  // is starting up, not by whatever is already running. This is the experiment:
+  // hold a client across a browser's startup and see whether the renderer's tree
+  // appears where it otherwise never does.
+  if (o.hold > 0) {
+    bool listening = false;
+    ghost::hold_accessibility_client(o.hold, &listening);
+    std::printf("held      %ds (clients %s)\n", o.hold,
+                listening ? "listening" : "not listening");
+  }
+  std::vector<std::string> positional;
+  if (!o.sub.empty()) positional.push_back(o.sub);
+  for (const std::string& arg : o.rest) positional.push_back(arg);
+
+  HWND window = nullptr;
+  const std::string subject = positional.empty() ? std::string() : positional[0];
+
+  if (!subject.empty()) {
+    const bool numeric = subject.find_first_not_of("0123456789") == std::string::npos;
+    if (numeric) {
+      window = ghost::main_window(
+                   static_cast<DWORD>(std::strtoul(subject.c_str(), nullptr, 10)))
+                   .handle;
+    } else {
+      struct Search {
+        const std::string* needle;
+        HWND found;
+      } search{&subject, nullptr};
+      EnumWindows(
+          [](HWND hwnd, LPARAM param) -> BOOL {
+            Search* s = reinterpret_cast<Search*>(param);
+            char title[512] = "";
+            GetWindowTextA(hwnd, title, sizeof(title));
+            if (std::strstr(title, s->needle->c_str()) != nullptr) {
+              s->found = hwnd;
+              return FALSE;
+            }
+            return TRUE;
+          },
+          reinterpret_cast<LPARAM>(&search));
+      window = search.found;
+    }
+  }
+
+  if (window == nullptr) {
+    std::printf("ghost: no window matched \"%s\"\n", subject.c_str());
+    return 1;
+  }
+
+  const ghost::WindowInfo info = ghost::describe_window(window);
+  std::printf("window    %p  pid %lu\n", static_cast<void*>(info.handle),
+              static_cast<unsigned long>(info.pid));
+  std::printf("title     %s\n", info.title.c_str());
+  std::printf("class     %s\n", info.class_name.c_str());
+  std::printf("client    %dx%d at %ld,%ld\n", info.client_width, info.client_height,
+              info.client.left, info.client.top);
+
+  // Chromium only builds the renderer's accessibility tree when it believes a
+  // UI Automation client is listening, and that belief is a flag owned by
+  // uiautomationcore rather than by Chromium. Printing it next to the walk is
+  // what separates "the page is not exposed" from "the walk cannot see it".
+  {
+    using ListeningFn = BOOL(WINAPI*)();
+    const HMODULE core = LoadLibraryW(L"uiautomationcore.dll");
+    ListeningFn listening = core == nullptr
+                                ? nullptr
+                                : reinterpret_cast<ListeningFn>(
+                                      GetProcAddress(core, "UiaClientsAreListening"));
+    std::printf("clients   %s\n",
+                listening == nullptr ? "unknown"
+                                     : (listening() ? "listening" : "not listening"));
+  }
+  std::printf("foreground %p\n", static_cast<void*>(GetForegroundWindow()));
+
+  // Asking is the trigger: Chromium builds the tree in response to the first
+  // query, so a false here means it never answered at all.
+  const bool primed = ghost::prime_accessibility(window, 8000);
+  std::printf("primed    %s\n", primed ? "yes" : "no");
+
+  int depth = 32;
+  int max_nodes = 4000;
+  if (positional.size() >= 2) depth = std::atoi(positional[1].c_str());
+  if (positional.size() >= 3) max_nodes = std::atoi(positional[2].c_str());
+
+  std::string error;
+  const std::vector<ghost::Element> nodes =
+      subtree ? ghost::dump_descendants(window, max_nodes, &error)
+              : ghost::dump_tree(window, depth, max_nodes, true, &error);
+  if (nodes.empty()) {
+    std::printf("no elements%s%s\n", error.empty() ? "" : ": ", error.c_str());
+    return 1;
+  }
+  for (const ghost::Element& element : nodes) {
+    std::printf("%2d %-14s id=%-22s %s\n", element.depth, element.role.c_str(),
+                element.automation_id.empty() ? "-" : element.automation_id.c_str(),
+                element.name.c_str());
+  }
+  std::printf("%zu elements%s\n", nodes.size(), subtree ? " (one query, no walk)" : "");
+  return 0;
+}
+
 // Adding the install directory to the user PATH is the closest thing to an
 // installer that a portable executable can honestly offer.
 int cmd_install(const Options& o) {
@@ -838,6 +965,7 @@ int cmd_serve(const Options& o) {
                                         : o.user_data_dir;
   so.chrome_args = o.chrome_args;
   so.sandbox = o.sandbox;
+  so.cdp = !o.no_cdp;
   so.verbose = o.verbose;
 
   // The first positional is a possible subcommand, so a URL lands in `sub`.
@@ -910,6 +1038,7 @@ int main() {
   if (o.command == "__probe") return cmd_probe(o);
   if (o.command == "__audio") return cmd_audio(o);
   if (o.command == "__speech") return cmd_speech(o);
+  if (o.command == "__uia") return cmd_uia(o);
 
   std::fprintf(stderr, "ghost: unknown command '%s'\n\n", o.command.c_str());
   print_usage();

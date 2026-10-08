@@ -11,6 +11,7 @@
 #include "audio_capture.h"
 #include "captcha.h"
 #include "capture.h"
+#include "cdp.h"
 #include "chrome.h"
 #include "embed.h"
 #include "input.h"
@@ -41,6 +42,12 @@ struct Session {
   // because the tier that needs it is reached from a request, and a request has no
   // business carrying a secret the profile already states.
   std::string captcha_api_key;
+  // The DevTools session, when this session was started with the pipe transport.
+  // It exists for the parts of a challenge that no amount of synthesized input can
+  // reach -- a hidden form field, or an audio element's own URL -- and it is not
+  // connected at all when the browser was started with --no-cdp.
+  CdpClient cdp;
+  bool cdp_enabled = false;
   bool verbose = false;
 };
 
@@ -555,6 +562,200 @@ std::string stream_summary() {
   return out.empty() ? std::string("only system sounds held a stream") : out;
 }
 
+// What the widget says about itself, read out of the document.
+//
+// None of this is in the accessibility tree, and not by accident: a site key is an
+// attribute, the response field is hidden from sight and from the tree alike, and
+// the callback that tells the page a token arrived is a JavaScript property. A tree
+// of controls cannot express any of them, which is why the token route needs a
+// transport that reads the document itself.
+const char kCaptchaFactsJs[] = R"JS(
+(function () {
+  var out = {sitekey: "", page_url: location.href, response_field: false,
+             recaptcha: false, hcaptcha: false, turnstile: false};
+  var holder = document.querySelector("[data-sitekey]");
+  if (holder) out.sitekey = holder.getAttribute("data-sitekey") || "";
+  if (!out.sitekey) {
+    var frames = document.querySelectorAll("iframe[src]");
+    for (var i = 0; i < frames.length; i++) {
+      var src = frames[i].getAttribute("src") || "";
+      var match = src.match(/[?&](?:k|sitekey)=([^&]+)/);
+      if (match) { out.sitekey = decodeURIComponent(match[1]); break; }
+    }
+  }
+  out.recaptcha = !!document.querySelector(".g-recaptcha, [data-sitekey]");
+  out.hcaptcha = !!document.querySelector(".h-captcha, [data-hcaptcha-sitekey]");
+  out.turnstile = !!document.querySelector(".cf-turnstile, [data-turnstile-sitekey]");
+  out.response_field = !!document.querySelector(
+      "textarea[name=g-recaptcha-response], #g-recaptcha-response, " +
+      "textarea[name=h-captcha-response], input[name=cf-turnstile-response]");
+  return JSON.stringify(out);
+})()
+)JS";
+
+// Hands the token to the page the way the widget itself would: into the hidden
+// field, and then through the widget's own callback when it has one. The callback
+// matters because a page that registered one never looks at the field.
+std::string captcha_token_js(const std::string& token) {
+  return std::string(
+             "(function (token) {"
+             "  var names = ['g-recaptcha-response', 'h-captcha-response',"
+             "               'cf-turnstile-response'];"
+             "  var filled = 0;"
+             "  for (var n = 0; n < names.length; n++) {"
+             "    var fields = document.querySelectorAll("
+             "        '[name=\"' + names[n] + '\"], #' + names[n]);"
+             "    for (var i = 0; i < fields.length; i++) {"
+             "      fields[i].value = token;"
+             "      fields[i].innerHTML = token;"
+             "      filled++;"
+             "    }"
+             "  }"
+             "  var called = false;"
+             "  try {"
+             "    var cfg = window.___grecaptcha_cfg;"
+             "    if (cfg && cfg.clients) {"
+             "      for (var k in cfg.clients) {"
+             "        var client = cfg.clients[k];"
+             "        for (var c in client) {"
+             "          var holder = client[c];"
+             "          if (holder && typeof holder.callback === 'function') {"
+             "            holder.callback(token);"
+             "            called = true;"
+             "          }"
+             "        }"
+             "      }"
+             "    }"
+             "  } catch (e) {}"
+             "  return JSON.stringify({filled: filled, callback: called});"
+             "})(") +
+         json_quote(token) + ")";
+}
+
+// Submits whatever form the response field belongs to. Doing it through the field
+// rather than through a button keeps this working on pages that have no button at
+// all, which is the common case for a widget inside someone else's form.
+const char kCaptchaSubmitJs[] = R"JS(
+(function () {
+  var field = document.querySelector(
+      "[name=g-recaptcha-response], #g-recaptcha-response, " +
+      "[name=h-captcha-response], [name=cf-turnstile-response]");
+  if (field) {
+    var form = field.form || (field.closest ? field.closest("form") : null);
+    if (form) { form.submit(); return "form"; }
+  }
+  var button = document.querySelector(
+      "#recaptcha-verify-button, button[type=submit], input[type=submit]");
+  if (button) { button.click(); return "button"; }
+  return "nothing";
+})()
+)JS";
+
+// The token route: ask a service for the string the widget would have produced,
+// and give it to the page directly.
+//
+// This is the only route that solves an image challenge, and the reason is not
+// cleverness. The service reproduces the challenge itself from the site key and
+// the page URL, so nothing has to be photographed or described. What the previous
+// tiers could not do was the last step -- put the answer where the page looks --
+// and that step is a write into a hidden field, which is a DOM operation.
+Json captcha_solve_token(Session& session, const Json& request, const CaptchaInfo& info) {
+  if (!session.cdp_enabled || !session.cdp.connected()) {
+    return failure(
+        "the token route needs the DevTools pipe; this session was started with --no-cdp");
+  }
+
+  std::string error;
+  std::string facts_text;
+  if (!session.cdp.evaluate(kCaptchaFactsJs, &facts_text, &error)) return failure(error);
+  std::string parse_error;
+  const Json facts = Json::parse(facts_text, &parse_error);
+  if (!facts.is_object()) {
+    return failure("the page did not describe its challenge: " + parse_error);
+  }
+
+  const Json* sitekey = facts.find("sitekey");
+  const Json* page_url = facts.find("page_url");
+  std::string key = sitekey != nullptr ? sitekey->as_string() : std::string();
+  const std::string url = page_url != nullptr ? page_url->as_string() : std::string();
+  // The tree's own reading is the fallback: it saw the widget before the DOM was
+  // asked, and on some pages it is the one that found the key.
+  if (key.empty()) key = info.site_key;
+
+  Json out = success();
+  out.set("page_url", Json::string(url));
+  if (!key.empty()) out.set("site_key", Json::string(key));
+  if (facts.find("recaptcha") != nullptr && facts.find("recaptcha")->as_bool(false)) {
+    out.set("kind", Json::string("recaptcha"));
+  } else if (facts.find("hcaptcha") != nullptr && facts.find("hcaptcha")->as_bool(false)) {
+    out.set("kind", Json::string("hcaptcha"));
+  } else if (facts.find("turnstile") != nullptr && facts.find("turnstile")->as_bool(false)) {
+    out.set("kind", Json::string("turnstile"));
+  }
+  out.set("response_field",
+          Json::boolean(facts.find("response_field") != nullptr &&
+                        facts.find("response_field")->as_bool(false)));
+
+  if (key.empty()) {
+    out.set("ok", Json::boolean(false));
+    out.set("error", Json::string("the page carries no site key to solve for"));
+    return out;
+  }
+
+  const SolveApi api = resolve_solve_api(arg_string(request, "key"), session.captcha_api_key);
+  if (api.provider.empty()) {
+    out.set("ok", Json::boolean(false));
+    out.set("error", Json::string(
+                         "no solving service is configured: set GHOST_CAPTCHA_KEY, or add "
+                         "\"captcha_api_key\" to the profile"));
+    return out;
+  }
+  out.set("provider", Json::string(api.provider));
+
+  std::string token;
+  if (!solve_recaptcha_api(api, key, url, &token, &error)) {
+    out.set("ok", Json::boolean(false));
+    out.set("error", Json::string(error));
+    return out;
+  }
+  out.set("token_length", Json::integer(static_cast<long long>(token.size())));
+
+  std::string injected;
+  if (!session.cdp.evaluate(captcha_token_js(token), &injected, &error)) {
+    out.set("ok", Json::boolean(false));
+    out.set("error", Json::string(error));
+    return out;
+  }
+  const Json placed = Json::parse(injected, &parse_error);
+  long long filled = 0;
+  if (placed.is_object()) {
+    const Json* count = placed.find("filled");
+    const Json* callback = placed.find("callback");
+    if (count != nullptr) filled = static_cast<long long>(count->as_number(0));
+    out.set("fields_filled", Json::integer(filled));
+    if (callback != nullptr) out.set("callback_called", Json::boolean(callback->as_bool(false)));
+  }
+  if (filled == 0) {
+    // A token that reached no field is not a solve, and saying so here is the
+    // difference between a caller retrying and a caller believing it worked.
+    out.set("ok", Json::boolean(false));
+    out.set("error", Json::string(
+                         "the page has no response field to receive the token; the widget "
+                         "may not have finished loading"));
+    return out;
+  }
+
+  std::string submitted;
+  if (!session.cdp.evaluate(kCaptchaSubmitJs, &submitted, &error)) {
+    out.set("ok", Json::boolean(false));
+    out.set("error", Json::string(error));
+    return out;
+  }
+  out.set("submitted", Json::string(submitted));
+  out.set("solved_by", Json::string("api"));
+  return out;
+}
+
 Json cmd_captcha(Session& session, const Json& request) {
   std::string error;
   if (!refresh(session, &error)) return failure(error);
@@ -576,8 +777,12 @@ Json cmd_captcha(Session& session, const Json& request) {
 
   // `wait` is the tier that exists to not act, so it gets the whole timeout to
   // watch a challenge arrive; every other action just needs the loading gap
-  // covered before it decides there is nothing here.
-  const int appear_budget = (action == "wait") ? timeout_ms : wait_ms;
+  // covered before it decides there is nothing here. The token route is the one
+  // exception in the other direction: it reads the document rather than the tree,
+  // so waiting for the tree to notice something would only be a delay.
+  const int appear_budget = (action == "wait")     ? timeout_ms
+                            : (action == "solve-token") ? 0
+                                                        : wait_ms;
   if (initial.provider == CaptchaProvider::kNone && appear_budget > 0) {
     if (!wait_for_challenge(session, &initial, appear_budget, &appeared_ms, &error)) {
       return failure(error);
@@ -629,6 +834,15 @@ Json cmd_captcha(Session& session, const Json& request) {
     out.set("state", Json::string(captcha_state_name(watched.state)));
     out.set("detail", Json::string(watched.detail));
     return out;
+  }
+
+  // The token route answers the challenge without touching the widget, and it does
+  // not need the tree to have recognised one: it asks the document, which is where
+  // the site key and the response field actually live. Running it before the
+  // `detect` return is what lets it work on a page whose widget the tree cannot
+  // describe.
+  if (action == "solve-token") {
+    return captcha_solve_token(session, request, initial);
   }
 
   if (action == "detect" || initial.provider == CaptchaProvider::kNone) {
@@ -1104,6 +1318,100 @@ Json cmd_screenshot(Session& session, const Json& request) {
   return out;
 }
 
+// The escape hatch: one DevTools command, straight through.
+//
+// The rest of this control plane exists because the accessibility tree cannot
+// reach certain things -- a hidden form field, an element's own URL, the text of
+// an attribute no control exposes. This command is what those callers are built
+// on, and it is deliberately raw: the caller names the method and the parameters
+// and gets the browser's result back unchanged.
+//
+// It never sends Runtime.enable. That command is the one with a detectable side
+// effect (it changes what Error.stack and the console object look like from
+// inside the page); Runtime.evaluate needs no such setup.
+Json cmd_cdp(Session& session, const Json& request) {
+  if (!session.cdp_enabled) {
+    return failure("this session was started with --no-cdp, so there is no DevTools pipe");
+  }
+  if (!session.cdp.connected()) {
+    return failure("no DevTools pipe is attached to this session");
+  }
+
+  const std::string method = arg_string(request, "method");
+  if (method.empty()) {
+    Json out = success();
+    out.set("connected", Json::boolean(true));
+    out.set("page_session", Json::boolean(!session.cdp.page_session().empty()));
+    return out;
+  }
+
+  // "browser" addresses the browser itself (Target.*, Browser.*). Anything else
+  // is page-scoped and needs the session id from an attach.
+  const std::string scope = arg_string(request, "session");
+  std::string session_id;
+  if (scope != "browser") {
+    std::string attach_error;
+    if (!session.cdp.attach_to_page(&attach_error)) return failure(attach_error);
+    session_id = session.cdp.page_session();
+  }
+
+  const Json* params = request.find("params");
+  Json result;
+  std::string error;
+  if (!session.cdp.call(method, params != nullptr ? *params : Json::object(), session_id,
+                        &result, &error)) {
+    return failure(error);
+  }
+
+  Json out = success();
+  out.set("method", Json::string(method));
+  out.set("result", result);
+  return out;
+}
+
+// Chromium marks a renderer hidden when its window cannot become the foreground
+// window, and a hidden renderer does two things that look like unrelated bugs: it
+// does not build an accessibility tree, and it silently discards every CDP input
+// event. So `tree`, `find`, `click` and `type` all go dead at once, with no error
+// reported anywhere -- the raw Input replies are a cheerful `{}`. One DevTools call
+// brings the renderer back, and it has to be made before the first `tree` is asked
+// for: the tree appears when the renderer learns it is visible, not when a client
+// asks for it.
+//
+// It is applied only when the page really does report itself hidden *and* this
+// session has no foreground window at all. On a machine where somebody is looking
+// at the browser, forcing focus would keep the page from ever seeing a blur, which
+// is an anomaly of its own -- so the anomalous state is repaired and the normal one
+// is left alone.
+void repair_hidden_renderer(Session& session) {
+  if (!session.cdp_enabled || !session.cdp.connected()) return;
+  if (GetForegroundWindow() != nullptr) return;
+
+  // The first document may not have committed yet, so give the page a few seconds
+  // to say what it is rather than reading about:blank and concluding all is well.
+  for (int attempt = 0; attempt < 20; ++attempt) {
+    std::string attach_error;
+    std::string value;
+    std::string error;
+    if (session.cdp.attach_to_page(&attach_error) &&
+        session.cdp.evaluate("document.visibilityState", &value, &error)) {
+      if (value.find("hidden") == std::string::npos) return;
+      Json params = Json::object();
+      params.set("enabled", Json::boolean(true));
+      Json result;
+      if (session.cdp.call("Emulation.setFocusEmulationEnabled", params,
+                           session.cdp.page_session(), &result, &error)) {
+        std::printf("ghost serve: renderer was hidden (no foreground window); focus emulation on\n");
+      } else {
+        std::printf("ghost serve: renderer is hidden and could not be woken: %s\n", error.c_str());
+      }
+      std::fflush(stdout);
+      return;
+    }
+    Sleep(250);
+  }
+}
+
 // There is deliberately no "call" command here. One existed until 0.5.0 and it
 // forwarded the incoming request back down the same pipe, so {"cmd":"call"}
 // re-entered itself and hung until the client's timeout. A nested request has no
@@ -1124,6 +1432,7 @@ Json dispatch(Session& session, const Json& request, bool* stop) {
   if (command == "tree") return cmd_tree(session, request);
   if (command == "find") return cmd_find(session, request);
   if (command == "captcha") return cmd_captcha(session, request);
+  if (command == "cdp") return cmd_cdp(session, request);
   if (command == "click") return cmd_click(session, request);
   if (command == "type") return cmd_type(session, request);
   if (command == "key") return cmd_key(session, request);
@@ -1222,6 +1531,8 @@ int run_serve(const ServeOptions& options) {
     lo.verbose = options.verbose;
     lo.forward_stdio = false;
     lo.pid_out = &session.pid;
+    lo.cdp = options.cdp;
+    session.cdp_enabled = options.cdp;
 
     make_dirs(options.data_dir);
     lo.args = {
@@ -1239,13 +1550,27 @@ int run_serve(const ServeOptions& options) {
     for (const std::string& arg : options.chrome_args) lo.args.push_back(arg);
     for (const std::string& url : options.urls) lo.args.push_back(url);
 
+    HANDLE cdp_read = nullptr;
+    HANDLE cdp_write = nullptr;
+    if (options.cdp) {
+      lo.cdp_read_out = &cdp_read;
+      lo.cdp_write_out = &cdp_write;
+    }
+
     const int launch_code = launch_under_shim(lo);
     if (launch_code != 0) {
       std::fprintf(stderr, "ghost: the browser did not start (code %d)\n", launch_code);
       return launch_code;
     }
+    if (options.cdp) session.cdp.adopt(cdp_read, cdp_write);
     wait_for_window(session.pid, 20000);
   }
+
+  // Wake a hidden renderer before asking for its accessibility tree. This has to
+  // come first: while the renderer believes it is hidden it builds no tree at all,
+  // so priming accessibility before this would only confirm that there is nothing
+  // to prime.
+  repair_hidden_renderer(session);
 
   // Switch the renderer's accessibility tree on before any client gets to ask, so
   // the first `tree` or `find` sees the document rather than a tree made entirely

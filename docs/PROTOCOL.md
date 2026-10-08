@@ -7,15 +7,24 @@ can drive the browser from any language with no library and no dependency on us.
 ## Why a pipe and not CDP
 
 Chrome DevTools Protocol is the obvious choice and it is the wrong one for this
-product. `--remote-debugging-port` opens a TCP listener that any page can find by
-scanning ports, `Runtime.enable` has side effects a page can observe, and the
-protocol's own existence is one of the strongest automation signals there is.
+product's **control plane**. `--remote-debugging-port` opens a TCP listener that any
+page can find by scanning ports, and the protocol's own existence is one of the
+strongest automation signals there is.
 
 A named pipe is not reachable from a page. There is no port to scan, no socket to
-probe, no injected script, and nothing for `navigator.webdriver` or any other
-detector to notice. Input goes in through `SendInput` and the page is read through
-the UI Automation tree, so from inside the renderer everything that happens looks
-like a person using a keyboard and mouse.
+probe, and nothing for a detector to notice. Input goes in through `SendInput` and
+the page is read through the UI Automation tree, so from inside the renderer
+everything that happens looks like a person using a keyboard and mouse.
+
+That is about the transport *you* speak. `ghost` also keeps a DevTools channel of its
+own, over a second anonymous pipe (`--remote-debugging-pipe`, never a TCP port, and no
+`DevToolsActivePort` file in the profile), because two things cannot be done any other
+way: writing a hidden form field, and reading an `<audio>` element's own URL. It is
+driven with `Runtime.evaluate`, which needs no `Runtime.enable`; nothing is injected
+that runs before the page's own code. Opening that pipe switches on Blink's
+`AutomationControlled` feature, which would set `navigator.webdriver` to `true`, so
+the launcher disables that feature together with the pipe that needs it. `--no-cdp`
+closes the channel and gives up the two abilities above, keeping the rest.
 
 The cost is real and worth stating: this is not a fast protocol for scripted bulk
 work. Each command is a round trip through the OS input stack. It is designed to
@@ -96,6 +105,8 @@ connection in a state where the next request is misaligned.
 | `key` | Press a key combination |
 | `scroll` | Scroll at a point |
 | `screenshot` | Capture the window to a BMP file |
+| `captcha` | Detect, wait for, and answer a human-verification challenge |
+| `cdp` | Send a DevTools protocol method straight through the pipe channel |
 | `shutdown` | Stop the server (and the browser it launched) |
 
 ### `status`
@@ -308,7 +319,7 @@ Reads the human-verification challenge on the page and, when asked, clicks it.
 
 | field | default | meaning |
 |---|---|---|
-| `action` | `solve` | `detect` reads only; `wait` reads and watches without clicking; `solve` also clicks the checkbox and watches; `solve-audio` records the audio challenge, transcribes it and answers it |
+| `action` | `solve` | `detect` reads only; `wait` reads and watches without clicking; `solve` also clicks the checkbox and watches; `solve-audio` records the audio challenge, transcribes it and answers it; `solve-token` has a solving service answer it and writes the token into the page |
 | `timeout` | `30000` | milliseconds to keep watching after the click, or for `wait` to keep watching at all |
 | `wait_ms` | `3000` | how long the *first* look may keep looking for a challenge to appear; `0` means a single sample |
 | `seconds` | `10` | `solve-audio` only: how long to record, clamped to 2–30 |
@@ -368,15 +379,36 @@ started with; `GHOST_CAPTCHA_URL` overrides the service and defaults to
 `https://2captcha.com`. With no key, `provider` is empty and `solve-audio` stops at the
 local recogniser's honest refusal.
 
+`solve-token` is the route for **image** challenges, and it never looks at the image.
+A solving service rebuilds the challenge itself from the site key and the page URL, so
+nothing has to be photographed or described. What the earlier tiers could not do was
+the last step, and that step is a DOM write: the command reads `site_key` and
+`page_url` out of the document (falling back to the accessibility tree's own reading),
+asks the service, writes the returned token into the field the page actually looks at
+(`g-recaptcha-response` and its relatives), calls the page's own callback when one is
+registered, and submits the form.
+
+It returns `kind` (`recaptcha`/`hcaptcha`/`turnstile`), `response_field` — whether the
+page has a field that could receive a token at all — plus `fields_filled`,
+`callback_called`, `submitted` and `solved_by: "api"`. It fails loudly instead of
+claiming success: with no site key on the page it says `the page carries no site key to
+solve for`; with no service configured it says `no solving service is configured: set
+GHOST_CAPTCHA_KEY, or add "captcha_api_key" to the profile`; and when the token reached
+no field it says `the page has no response field to receive the token; the widget may
+not have finished loading`. A `fields_filled` of 0 is never reported as solved.
+
+This action needs the DevTools channel, because a hidden field cannot be written
+through the accessibility tree. Under `--no-cdp` it cannot run.
+
 `provider` is one of `none`, `hcaptcha`, `recaptcha`, `turnstile`. `state` is one of
 `absent`, `checkbox`, `visual`, `audio`, `solved`.
 
-Everything is read from the accessibility tree — the same tree `find` walks, which
-sees into the challenge's cross-origin iframe. A challenge frame's document node
-carries the frame's URL as its `value`, and the sitekey lives in that URL, so
-`site_key` is parsed out of it rather than guessed. `page_url` is the top-level
-document's URL. `challenge_token` is reCAPTCHA's `bft` parameter, which is what a
-solving service needs for an image challenge.
+Challenge facts come from the document when the DevTools channel is open, and from the
+accessibility tree otherwise — the same tree `find` walks, which sees into the
+challenge's cross-origin iframe. Either way a challenge frame carries its own URL, and
+the sitekey lives in that URL, so `site_key` is parsed out of it rather than guessed.
+`page_url` is the top-level document's URL. `challenge_token` is reCAPTCHA's `bft`
+parameter, which is what a solving service needs for an image challenge.
 
 `site_key` is empty for Cloudflare Turnstile: its widget document has no `value`, so
 the widget is recognized by name and automation id instead, and there is no URL to
@@ -400,6 +432,37 @@ there. The command keeps watching through it.
 A challenge that redraws between your `find` and your `click` invalidates them, which
 is why the command reads the tree again after every click it makes rather than reusing
 an index from before.
+
+### `cdp`
+
+Sends a DevTools protocol method straight through the pipe channel. This exists so a
+caller is not stuck waiting for a command to be written for it — not because it is the
+recommended way to drive the browser. Prefer `tree`, `find`, `click` and `type`, which
+do not enter the page's own world at all.
+
+| field | default | meaning |
+|---|---|---|
+| `method` | *required* | the DevTools method, e.g. `Page.getFrameTree` |
+| `params` | `{}` | the method's parameters, passed through unchanged |
+| `session` | `""` | `"browser"` addresses the browser; anything else is page-scoped |
+
+Returns `ok`, `method` and `result` — the protocol's own reply, unmodified.
+
+Nothing is enabled on your behalf: the command does not call `Runtime.enable` and does
+not subscribe to events, so `result` is whatever that one call returned. A method that
+expects an event stream will look like it returned nothing.
+
+Page-scoped calls attach to the page target first. A cross-site iframe is a separate
+target, so you need `Target.attachToTarget` yourself — `Page.getFrameTree` on the page
+target lists only the main frame.
+
+> **The renderer has to be visible.** In a session with no foreground window Chromium
+> marks the renderer hidden, and a hidden renderer both builds no accessibility tree
+> and silently discards every `Input` event — the replies are `{}` with no error, so it
+> looks like nothing happened. `ghost serve` repairs this at startup: it reads
+> `document.visibilityState` and, only when the session has no foreground window at
+> all, enables focus emulation. If you launched the browser yourself, this is yours to
+> handle.
 
 ### `shutdown`
 

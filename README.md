@@ -31,12 +31,13 @@ needed to work on the source or run the fingerprint test page under `harness/`.
 | Injection into sandboxed renderers | **blocked by the restricted token** |
 | WebGL vendor / renderer (`UNMASKED_*`) | **working** — via DXGI adapter identity |
 | Font enumeration (`document.fonts`, `measureText`) | **working** — DirectWrite collection filtered |
-| Zero-CDP control plane (`ghost serve`) | **working** — 19 checks |
+| Control plane (`ghost serve`) | **working** — 19 checks, named pipe, no TCP port |
+| DevTools channel (anonymous pipe, on by default) | **working** — no port, no `DevToolsActivePort` in the profile, `navigator.webdriver` still false |
 | Working with no foreground window | **working** — falls back to UI Automation and says which channel it used |
 | Reading a human-verification challenge | **working** — 33 checks |
 | Waiting for a challenge without touching it | **working** — `captcha action=wait` |
 | Clearing Cloudflare Turnstile | **working** — one click answers it |
-| hCaptcha / reCAPTCHA image challenges | **read and opened, not solved** |
+| hCaptcha / reCAPTCHA image challenges | **answered by a solving service** — `captcha action=solve-token` supplies the DOM write, not the recognition |
 | reCAPTCHA audio challenge | **recorded, transcribed and answered** — locally, or by a service when no recogniser fits |
 | hCaptcha audio challenge | **not driven** — a measured dead end: its menu button ignores UI Automation |
 | Window branding (title, icon, taskbar) | **working** |
@@ -197,11 +198,11 @@ Makefile, or a CI job as readily as from an application.
 Two pieces, because they answer different questions.
 
 **The MCP server** ([mcp/ghost_mcp.py](mcp/ghost_mcp.py)) supplies the capability:
-twelve tools covering open, navigate, read, find, wait, click, type, key, scroll,
-screenshot and close. It is a single standard-library Python file, it owns the
-browser's lifecycle, it renders the accessibility tree as text an LLM can act on
-(`[14] button "Sign in" @144,256`), and it converts screenshots to PNG because MCP
-image content does not carry BMP.
+fourteen tools covering open, navigate, read, find, wait, click, type, key, scroll,
+captcha, a raw DevTools call and close. It is a single standard-library Python file,
+it owns the browser's lifecycle, it renders the accessibility tree as text an LLM can
+act on (`[14] button "Sign in" @144,256`), and it converts screenshots to PNG because
+MCP image content does not carry BMP.
 
 ```bash
 claude mcp add ghost -- python /absolute/path/to/mcp/ghost_mcp.py
@@ -209,7 +210,8 @@ claude mcp add ghost -- python /absolute/path/to/mcp/ghost_mcp.py
 
 [mcp/README.md](mcp/README.md) has the generic `mcpServers` JSON, the tool table and
 the environment variables. `python tools/mcp_check.py` drives the whole thing the way
-a client does and reports **29 checks, 0 failed**.
+a client does and reports **35 checks, 0 failed** (1 not measurable without a
+foreground window).
 
 **The skill** ([skills/ghost/SKILL.md](skills/ghost/SKILL.md)) supplies the judgement:
 when this browser is the right tool and when an HTTP client is, the
@@ -267,6 +269,15 @@ challenge's language is installed **and** a key is configured (`GHOST_CAPTCHA_KE
 `captcha_api_key` in the profile). There is no built-in key: with none configured the
 third tier is off, not broken. The upload is down-mixed to 16 kHz mono 16-bit, about
 157 KB for a five-second challenge.
+
+An **image** challenge has no route like that: it cannot be read out of the
+accessibility tree, and it cannot be answered by typing. `captcha action=solve-token`
+hands it to a solving service instead — the service rebuilds the challenge from the site
+key and the page URL, and the browser writes the token it returns into the page's hidden
+`g-recaptcha-response` field and submits the form. That last step is a DOM write, and it
+is the reason the DevTools channel exists at all; under `--no-cdp` this route is
+unavailable. It reports `fields_filled` and refuses to call a token nobody received an
+answer.
 
 **One look is not a detection.** The widget animates in — on this machine Cloudflare's
 interstitial exposes no challenge at all for its first ~1.2 s, and hCaptcha's checkbox
@@ -340,10 +351,15 @@ browser process                     child processes
 
 Four deliberate design choices:
 
-1. **Zero CDP.** No `--remote-debugging-port`, no `Runtime.enable`, no injected utility
-   script. Those are the artifacts that actually get Playwright/Puppeteer caught — not
-   `navigator.webdriver`. Control will come from OS input synthesis and the accessibility
-   tree instead.
+1. **A DevTools channel with nothing left to scan.** The pipe, not the port:
+   `--remote-debugging-pipe` on anonymous handles the launcher creates and passes to the
+   child, so there is no TCP port for a page to scan and no `DevToolsActivePort` file in
+   the profile. It is driven with `Runtime.evaluate`, which needs no `Runtime.enable` —
+   that call changes the console object from inside the page and is one of the ways a
+   page detects DevTools. Opening the pipe also switches on Blink's `AutomationControlled`
+   feature, which sets `navigator.webdriver` to `true`; the launcher disables that feature
+   alongside the pipe that needs it. `--no-cdp` closes the channel entirely and falls back
+   to OS input synthesis and the accessibility tree.
 2. **Spoof at the OS API, not in JavaScript.** `navigator.hardwareConcurrency` is read
    from `GetNativeSystemInfo().dwNumberOfProcessors`; we hook that call. A page can call
    `Function.prototype.toString` on anything it likes and still see `[native code]`,
@@ -405,6 +421,7 @@ fresh Chrome launched by `ghost_launch`:
 | `navigator.webdriver` | false | false | pass |
 | Automation globals (`cdc_*`, `__playwright__`, …) | none | none | pass |
 | CDP ports 9222/9223/9229/9515 | closed | all closed | pass |
+| `DevToolsActivePort` in the profile | absent | absent | pass |
 | Hooked getters still report `[native code]` | yes | yes | pass |
 | `UNMASKED_VENDOR_WEBGL` | NVIDIA | NVIDIA | pass |
 | `UNMASKED_RENDERER_WEBGL` contains adapter description | RTX 3060 | RTX 3060 | pass |
@@ -488,9 +505,10 @@ native/
   ghost_cli/               the single shipped file, ghost.exe
     src/main.cpp             subcommand dispatch
     src/daemon.cpp           the control plane (`ghost serve`)
+    src/cdp.cpp              the DevTools channel over anonymous pipes
     src/uia.cpp              accessibility-tree reads and the priming fix
     src/pipe.cpp             the named pipe
-    src/input.cpp, window.cpp, capture.cpp, pipe.cpp   OS input, window capture
+    src/input.cpp, window.cpp, capture.cpp   OS input, window capture
   ghost_launch/            the launcher and injector
   tests/probe/             ground-truth value dumper (run with and without the shim)
 harness/
@@ -505,6 +523,8 @@ tools/
   product_check.py         end-to-end acceptance of the single shipped file
   serve_check.py           control-plane acceptance
   mcp_check.py             MCP acceptance
+  captcha_check.py         the three real challenges, end to end
+  token_check.py           the solving-service token route, against a stand-in service
   verify_ghost.ps1         proves ghost.exe is self-contained
   pe_exports.py            dependency-free PE export-table parser
   token_sids.ps1           process token / integrity / restricted-SID dumper

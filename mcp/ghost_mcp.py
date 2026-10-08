@@ -45,7 +45,7 @@ PROTOCOL_VERSION = "2025-06-18"
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 
 SERVER_NAME = "ghost"
-SERVER_VERSION = "0.9.0"
+SERVER_VERSION = "0.10.0"
 
 DEFAULT_ID = os.environ.get("GHOST_ID") or "mcp"
 READY_TIMEOUT = float(os.environ.get("GHOST_TIMEOUT") or 60)
@@ -505,13 +505,19 @@ TOOLS = [
             "and a solving service only when the machine has no recogniser for the "
             "challenge's language and GHOST_CAPTCHA_KEY (or the profile's "
             "captcha_api_key) is set. Reads 'peak' and 'play' to tell a silent page "
-            "from a recording that failed, and never retries in a loop."
+            "from a recording that failed, and never retries in a loop. With "
+            "action='solve-token' it asks a solving service for the signed token the "
+            "widget would have produced and writes it straight into the page's hidden "
+            "response field, then submits the form — this is the only route that "
+            "answers an image challenge, and it needs a solving service and a session "
+            "with the DevTools pipe (that is, not one started with --no-cdp)."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "action": {"type": "string",
-                           "enum": ["detect", "solve", "solve-audio", "wait"],
+                           "enum": ["detect", "solve", "solve-audio", "solve-token",
+                                    "wait"],
                            "default": "solve"},
                 "timeout": {"type": "integer", "default": 30000,
                             "description": "milliseconds to keep watching"},
@@ -531,6 +537,38 @@ TOOLS = [
                                           "in one call, 1-5. reCAPTCHA often rejects a "
                                           "correct answer once and plays the next "
                                           "clip; a second round answers that clip too"},
+                "key": {"type": "string",
+                        "description": "solve-token: the solving service's API key, "
+                                       "overriding GHOST_CAPTCHA_KEY and the profile"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "ghost_cdp",
+        "description": (
+            "Send one raw DevTools command to the browser and get its result back "
+            "unchanged. The channel is an anonymous pipe pair, so there is no "
+            "listening port and no DevToolsActivePort file in the profile; it is on "
+            "by default and `ghost serve --no-cdp` removes it entirely. This exists "
+            "for the things an accessibility tree cannot express — an element's own "
+            "attributes, a hidden form field, an audio element's URL — and it never "
+            "enables Runtime, so the page cannot see it through Error.stack. Use "
+            "'session' to choose the page (default) or the browser itself. With no "
+            "'method' it reports whether the pipe is attached."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "method": {"type": "string",
+                           "description": "a DevTools method, e.g. Runtime.evaluate or "
+                                          "DOM.getDocument"},
+                "params": {"type": "object",
+                           "description": "the method's parameters, passed through "
+                                          "unchanged"},
+                "session": {"type": "string", "enum": ["page", "browser"],
+                            "default": "page",
+                            "description": "page-scoped (default) or browser-scoped"},
             },
             "additionalProperties": False,
         },
@@ -689,15 +727,46 @@ def run_tool(session: Session, name: str, args: dict) -> dict:
                 params["language"] = args["language"]
             if args.get("keep"):
                 params["keep"] = True
+        if action == "solve-token":
+            if args.get("key"):
+                params["key"] = args["key"]
         response = session.call("captcha", **params)
         provider = response.get("provider", "none")
         state = response.get("state", "?")
-        if provider == "none":
+        # The token route reads the document rather than the tree, so a widget the
+        # tree could not describe is not a reason to call it off.
+        if provider == "none" and action != "solve-token":
             if action == "wait":
                 return tool_result(
                     "no human-verification challenge appeared within "
                     f"{response.get('waited_ms', 0)} ms of watching")
             return tool_result("no human-verification challenge on this page")
+
+        if action == "solve-token":
+            lines = []
+            if response.get("page_url"):
+                lines.append(f"page:     {response['page_url']}")
+            if response.get("site_key"):
+                lines.append(f"sitekey:  {response['site_key']}")
+            if response.get("kind"):
+                lines.append(f"kind:     {response['kind']}")
+            if response.get("provider"):
+                lines.append(f"service:  {response['provider']}")
+            if response.get("token_length") is not None:
+                lines.append(f"token:    {response['token_length']} chars")
+            if response.get("fields_filled") is not None:
+                lines.append(f"fields:   {response['fields_filled']} filled")
+            if response.get("callback_called") is not None:
+                lines.append(f"callback: {bool(response.get('callback_called'))}")
+            if response.get("submitted"):
+                lines.append(f"submitted:{response['submitted']}")
+            if response.get("error"):
+                lines.append(f"error:    {response['error']}")
+            elif response.get("solved_by") == "api":
+                lines.append("the service's token was placed and the form submitted; "
+                             "whether the page accepts it is the page's answer, not "
+                             "this tool's")
+            return tool_result("\n".join(lines) or "the token route returned nothing")
 
         lines = [f"provider: {provider}", f"state:    {state}"]
         if response.get("site_key"):
@@ -770,6 +839,22 @@ def run_tool(session: Session, name: str, args: dict) -> dict:
                 lines.append("an audio challenge is open — use action='solve-audio' to "
                              "record it and answer it automatically")
         return tool_result("\n".join(lines))
+
+    if name == "ghost_cdp":
+        params = {"action": "cdp"}
+        if args.get("method"):
+            params["method"] = args["method"]
+        if args.get("params"):
+            params["params"] = args["params"]
+        if args.get("session"):
+            params["session"] = args["session"]
+        response = session.call(**params)
+        if not args.get("method"):
+            return tool_result(
+                f"DevTools pipe attached: {bool(response.get('connected'))}; "
+                f"page session: {bool(response.get('page_session'))}")
+        return tool_result(json.dumps(response.get("result"), ensure_ascii=False,
+                                      indent=2))
 
     if name == "ghost_screenshot":
         # Write to a temp path rather than the default cache location, so repeated

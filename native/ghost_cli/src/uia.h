@@ -45,6 +45,18 @@ std::vector<Element> find_elements(HWND window, const std::string& role,
                                    const std::string& name_contains, int max_depth,
                                    int max_nodes, std::string* error);
 
+// Every descendant, asked for in one query rather than walked. Same contents as
+// dump_tree when the control view is behaving, which is what makes it useful
+// when it is not: it answers "is the element there at all" without a walker.
+std::vector<Element> dump_descendants(HWND window, int max_nodes, std::string* error);
+
+// Holds a UI Automation client open for `seconds` and reports what the platform
+// thinks of that. Chromium decides whether to build the renderer's tree from a
+// flag that only a *live* client sets, so the question "is anyone listening"
+// cannot be asked from inside a client that is about to exit -- it has to be
+// asked while one is held open.
+bool hold_accessibility_client(int seconds, bool* clients_listening);
+
 // Centre of an element's bounds, in physical screen pixels — the coordinates
 // SendInput wants.
 bool element_center(const Element& element, int* x, int* y);

@@ -6,9 +6,12 @@ description: Drive a real Chromium browser that presents no automation fingerpri
 # Driving the ghost browser
 
 `ghost` is a real Chromium with OS-level hooks that make it look like an ordinary
-desktop browser: no `navigator.webdriver`, no CDP port, no injected scripts, and
-input that goes through the same OS path a human's mouse and keyboard use. Sites
-that reject Playwright and Selenium generally treat it as a normal visitor.
+desktop browser: no `navigator.webdriver`, no CDP port, and input that goes through
+the same OS path a human's mouse and keyboard use. Sites that reject Playwright and
+Selenium generally treat it as a normal visitor. (It does keep a DevTools channel
+open internally, over an anonymous pipe rather than a port, because two things are
+impossible without one: writing a hidden form field, and reading an `<audio>`
+element's own URL. Nothing is injected into the page that runs before its own code.)
 
 ## Choosing how to drive it
 

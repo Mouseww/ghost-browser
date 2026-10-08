@@ -79,7 +79,8 @@ but `ghost serve` does not exist there yet.
 | `ghost_type` | `text` | Type into the focused field |
 | `ghost_key` | `key` \| `keys[]` | Press a key or a combination |
 | `ghost_scroll` | `delta?`, `css_x?`, `css_y?` | Scroll |
-| `ghost_captcha` | `action?` (`detect`/`wait`/`solve`/`solve-audio`), `timeout?`, `wait_ms?`, `seconds?`, `language?`, `keep?` | Read, watch, click, or record-and-answer a human-verification challenge |
+| `ghost_captcha` | `action?` (`detect`/`wait`/`solve`/`solve-audio`/`solve-token`), `timeout?`, `wait_ms?`, `seconds?`, `language?`, `keep?`, `rounds?`, `key?` | Read, watch, click, record-and-answer, or have a service answer a human-verification challenge |
+| `ghost_cdp` | `method`, `params?`, `session?` | Send one DevTools protocol call through the pipe channel |
 | `ghost_screenshot` | — | Capture the window as PNG |
 | `ghost_close` | — | Close the browser and stop the server |
 
@@ -88,11 +89,14 @@ from that page → `ghost_page` again to see what changed. `ghost_wait_for` cove
 gap between an action and the content it loads.
 
 When a page is behind a human-verification challenge, call `ghost_captcha` instead of
-hunting for the checkbox yourself. It reads the challenge from the accessibility tree
-and returns the provider, the state and the sitekey; with `action="solve"` it clicks
-the checkbox and reports where that got you. Cloudflare Turnstile usually passes from
-that click alone. hCaptcha and reCAPTCHA escalate to an image or audio challenge,
-which the tool reports honestly rather than pretending to have solved.
+hunting for the checkbox yourself. It reads the challenge — from the document when the
+DevTools channel is open, from the accessibility tree otherwise — and returns the
+provider, the state and the sitekey; with `action="solve"` it clicks the checkbox and
+reports where that got you. Cloudflare Turnstile usually passes from that click alone.
+hCaptcha and reCAPTCHA escalate to an image or audio challenge. `solve-audio` answers
+an audio one on this machine; `solve-token` has a solving service answer an image one
+and writes the token into the page, which needs a service key and a session with the
+DevTools pipe. Neither pretends to have solved something it did not.
 
 **One look is not a detection.** The widget animates in, so for roughly the first
 second a page that is about to challenge you looks exactly like a page that never will.

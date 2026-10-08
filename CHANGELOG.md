@@ -5,9 +5,38 @@ All notable changes to this project are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.10.0] - 2026-10-09
 
 ### Added
+
+- **A DevTools channel over anonymous pipes, on by default.** The previous releases
+  were built on the claim that a browser can be driven with no DevTools protocol at
+  all, using OS input synthesis and the accessibility tree instead. That claim held,
+  but it made two things impossible rather than merely hard: a hidden form field
+  cannot be written to and an `<audio>` element's own URL cannot be read, so the last
+  step of a challenge solve — putting the answer where the page looks — had no route.
+  `ghost` now opens `--remote-debugging-pipe` on handles the launcher creates and
+  hands to the child (`--remote-debugging-io-pipes`), so there is still **no TCP
+  port** for a page to scan and **no `DevToolsActivePort` file** in the profile, and
+  the protocol is not reachable from the page's own network view. `--no-cdp` restores
+  the old behaviour exactly. The channel is used through `Runtime.evaluate` only,
+  which needs no `Runtime.enable` — that call changes what the console object looks
+  like from inside the page and is one of the standard ways a page detects DevTools.
+- **`captcha action=solve-token`: a solving service's token, placed and submitted.**
+  This is the first route that can answer an *image* challenge, and not by being
+  clever: the service rebuilds the challenge itself from the site key and the page
+  URL, so nothing has to be photographed or described. What the earlier tiers could
+  not do was the last step, and that step is a DOM write. The command reads the site
+  key and page URL out of the document (falling back to the accessibility tree's own
+  reading), asks the service, writes the token into the field the page actually looks
+  at, calls the page's own callback when one is registered, and submits. It reports
+  `fields_filled` and refuses to call itself solved when the token reached no field.
+  Acceptance uses a stand-in service and a stand-in page (`tools/token_check.py`)
+  because there is no key in this repository and there is not going to be one; the
+  vendor's own accuracy is left to the vendor.
+- **`ghost call --cmd cdp` / the `ghost_cdp` MCP tool**, so a caller can send a
+  DevTools method directly instead of waiting for a command to be written for it.
+  `session: "browser"` addresses the browser; anything else is page-scoped.
 
 - **`captcha action=solve-audio` now answers multi-round challenges in one call.**
   reCAPTCHA's audio challenge often rejects one correct answer and plays the next clip,
@@ -62,6 +91,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   regardless of depth; the depth tie-break only ranks documents of the same kind.
   Measured on the DeepSeek signup page: `page_url` now reads
   `https://platform.deepseek.com/sign_up` where it previously read `about:blank`.
+
+### Fixed
+
+- **A hidden renderer is now woken, which is what made the accessibility tree and
+  CDP input go dead together.** In a session that cannot deliver input — a
+  disconnected or headless RDP session, where `GetForegroundWindow()` is 0 — Chromium
+  marks the renderer hidden, and a hidden renderer does two things that look like
+  unrelated bugs: it builds no accessibility tree, and it silently discards every
+  DevTools `Input` event. So `tree` returned browser chrome only, `find` returned
+  nothing, and a click through the DevTools channel did nothing at all while the raw
+  replies said `{}` — no error anywhere. The whole of it is one condition and one
+  call: `Emulation.setFocusEmulationEnabled`. Isolated by enabling it and *nothing
+  else*, with no navigation in between: `document.visibilityState` went `hidden` →
+  `visible`, the accessibility tree went from 44 lines of browser chrome to 71 lines
+  including `document id=RootWebArea "Example Domain"` and the page's own `link
+  "Learn more"`, and a click on that link navigated. It is applied at session start,
+  before the accessibility tree is primed (the tree is built when the renderer learns
+  it is visible, not when a client asks), and **only** when the page really reports
+  itself hidden *and* the session has no foreground window at all: on a machine where
+  somebody is looking at the browser, forcing focus would keep the page from ever
+  seeing a blur, which is an anomaly of its own.
+- **`navigator.webdriver` was `true` whenever the DevTools pipe was open.** Opening
+  the pipe switches on Blink's `AutomationControlled` feature, so the browser started
+  telling every page it was automated — the single most widely checked automation tell
+  there is, and a direct contradiction of what this project exists to do. Measured
+  three ways on the same build, with the value published into `document.title` so it
+  could be read without the very channel under test: CDP on → `webdriver=true`,
+  `--no-cdp` → `false`, CDP on with `--disable-blink-features=AutomationControlled` →
+  `false`. The flag is now merged into any `--disable-blink-features` the caller
+  already passed, because Chrome honours only one occurrence of the switch, and it
+  travels with the pipe that needs it. After the fix all three configurations report
+  `webdriver=false`, and `serve_check.py`'s "no automation globals are visible to the
+  page" check — which had been passing only because the page was unreadable — passes
+  for the right reason.
 
 ## [0.9.0] - 2026-10-07
 

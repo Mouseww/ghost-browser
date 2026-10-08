@@ -57,6 +57,88 @@ int launch_under_shim(const LaunchOptions& options) {
     std::printf("TZ          : %s\n", options.timezone.c_str());
   }
 
+  // DevTools over anonymous pipes.
+  //
+  // Chrome's usual transport is a TCP port plus a `DevToolsActivePort` file in
+  // the profile, and both are discoverable from inside the browser's own user
+  // account. On Windows there is a second one: `--remote-debugging-pipe` speaks
+  // the protocol on file descriptors 3 and 4, and `--remote-debugging-io-pipes`
+  // replaces those descriptors with two handle values the launcher picks
+  // (content_switches.cc). When that switch is present Chrome skips the
+  // descriptor check (chrome_main_delegate.cc:1221-1233), which is the only
+  // reason a launcher can supply handles of its own.
+  //
+  // Handle inheritance preserves the numeric value, so the child ends are passed
+  // on the command line exactly as created. Only the child's ends are made
+  // inheritable: an inherited parent end would keep the pipe open inside the
+  // browser and an end of stream would never arrive.
+  HANDLE cdp_child_read = nullptr;
+  HANDLE cdp_child_write = nullptr;
+  HANDLE cdp_parent_read = nullptr;
+  HANDLE cdp_parent_write = nullptr;
+  if (options.cdp) {
+    SECURITY_ATTRIBUTES attrs{};
+    attrs.nLength = sizeof(attrs);
+    attrs.bInheritHandle = TRUE;
+    if (CreatePipe(&cdp_child_read, &cdp_parent_write, &attrs, 0) == FALSE ||
+        CreatePipe(&cdp_parent_read, &cdp_child_write, &attrs, 0) == FALSE) {
+      std::fprintf(stderr, "ghost: cannot create the DevTools pipes: %lu\n",
+                   GetLastError());
+      return 1;
+    }
+    SetHandleInformation(cdp_parent_read, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(cdp_parent_write, HANDLE_FLAG_INHERIT, 0);
+    command_line += " --remote-debugging-pipe --remote-debugging-io-pipes=" +
+                    std::to_string(static_cast<unsigned long long>(
+                        reinterpret_cast<ULONG_PTR>(cdp_child_read))) +
+                    "," +
+                    std::to_string(static_cast<unsigned long long>(
+                        reinterpret_cast<ULONG_PTR>(cdp_child_write)));
+
+    // Opening the pipe also switches on Blink's AutomationControlled feature, so
+    // the browser starts telling every page it is automated: `navigator.webdriver`
+    // becomes true. That is the single most widely checked automation tell there
+    // is, and it is true *only* because the pipe is open -- measured directly, the
+    // same build reports false under --no-cdp. The pipe and the cure therefore
+    // travel together.
+    //
+    // Chrome honours one occurrence of the switch, so the feature is merged into
+    // whatever the caller already passed instead of being appended as a second
+    // --disable-blink-features.
+    const std::string blink_switch = "--disable-blink-features=";
+    const std::string blink_feature = "AutomationControlled";
+    const std::size_t blink_at = command_line.find(blink_switch);
+    if (blink_at == std::string::npos) {
+      command_line += " " + blink_switch + blink_feature;
+    } else {
+      std::size_t blink_end = command_line.find(' ', blink_at);
+      if (blink_end == std::string::npos) blink_end = command_line.size();
+      if (command_line.substr(blink_at, blink_end - blink_at).find(blink_feature) ==
+          std::string::npos) {
+        command_line.insert(blink_end, "," + blink_feature);
+      }
+    }
+  }
+
+  const auto release_cdp = [&]() {
+    if (cdp_child_read != nullptr) {
+      CloseHandle(cdp_child_read);
+      cdp_child_read = nullptr;
+    }
+    if (cdp_child_write != nullptr) {
+      CloseHandle(cdp_child_write);
+      cdp_child_write = nullptr;
+    }
+    if (cdp_parent_read != nullptr) {
+      CloseHandle(cdp_parent_read);
+      cdp_parent_read = nullptr;
+    }
+    if (cdp_parent_write != nullptr) {
+      CloseHandle(cdp_parent_write);
+      cdp_parent_write = nullptr;
+    }
+  };
+
   STARTUPINFOA startup{};
   startup.cb = sizeof(startup);
 
@@ -86,12 +168,15 @@ int launch_under_shim(const LaunchOptions& options) {
   // Handle inheritance is only about handles. The child's environment comes from
   // lpEnvironment (nullptr = inherit ours) whether or not handles are inherited,
   // so the profile reaches the target either way.
-  const BOOL inherit =
-      (capture != INVALID_HANDLE_VALUE || options.forward_stdio) ? TRUE : FALSE;
+  const BOOL inherit = (capture != INVALID_HANDLE_VALUE || options.forward_stdio ||
+                        options.cdp)
+                           ? TRUE
+                           : FALSE;
   if (CreateProcessA(nullptr, command_line.data(), nullptr, nullptr, inherit,
                      CREATE_SUSPENDED, nullptr, nullptr, &startup, &process) == FALSE) {
     const DWORD error = GetLastError();
     std::fprintf(stderr, "ghost: CreateProcess failed: %lu\n", error);
+    release_cdp();
     // 225 = ERROR_VIRUS_INFECTED. "Suspend a process, write a DLL path into it,
     // start a remote thread" is the shape of a loader, so antivirus heuristics
     // do flag the shim. The fix is an exclusion, not a retry.
@@ -107,6 +192,25 @@ int launch_under_shim(const LaunchOptions& options) {
   if (options.verbose) std::printf("suspended pid: %lu\n", process.dwProcessId);
   if (options.pid_out != nullptr) *options.pid_out = process.dwProcessId;
 
+  if (options.cdp) {
+    // The browser owns the child ends now. Closing ours in this process is what
+    // makes the pipe report an end of stream when the browser exits, rather than
+    // leaving a reader blocked on a handle only this dead launcher still holds.
+    if (cdp_child_read != nullptr) {
+      CloseHandle(cdp_child_read);
+      cdp_child_read = nullptr;
+    }
+    if (cdp_child_write != nullptr) {
+      CloseHandle(cdp_child_write);
+      cdp_child_write = nullptr;
+    }
+    if (options.cdp_read_out != nullptr) *options.cdp_read_out = cdp_parent_read;
+    if (options.cdp_write_out != nullptr) *options.cdp_write_out = cdp_parent_write;
+    // Ownership moved to the caller; release_cdp must not close them.
+    cdp_parent_read = nullptr;
+    cdp_parent_write = nullptr;
+  }
+
   const auto release_capture = [&]() {
     if (capture != INVALID_HANDLE_VALUE) {
       CloseHandle(capture);
@@ -119,6 +223,7 @@ int launch_under_shim(const LaunchOptions& options) {
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
     release_capture();
+    release_cdp();
     return code;
   };
 

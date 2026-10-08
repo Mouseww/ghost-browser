@@ -36,6 +36,18 @@ bool solve_audio_api(const SolveApi& api, const std::string& wav_path,
                      const std::string& language, std::string* digits,
                      std::string* error);
 
+// Asks the service for a reCAPTCHA token, which is what a widget on the page
+// actually wants: not the digits a human would type, but a signed string that the
+// page's own script posts to its server.
+//
+// This is the route the audio tier cannot take. A token has to be placed in the
+// widget's hidden response field, and a hidden field is precisely what an
+// accessibility tree does not contain -- so this call only makes sense next to a
+// DOM-reading transport.
+bool solve_recaptcha_api(const SolveApi& api, const std::string& site_key,
+                         const std::string& page_url, std::string* token,
+                         std::string* error);
+
 // Standard base64, no line breaks. Exposed because the request body needs it and
 // there is no reason for a second copy of it to exist.
 std::string base64_encode(const unsigned char* data, size_t size);
