@@ -454,6 +454,26 @@ bool element_center(const Element& element, int* x, int* y) {
   return true;
 }
 
+bool scroll_element_into_view(HWND window, int index, std::string* error) {
+  std::string local;
+  if (error == nullptr) error = &local;
+  error->clear();
+
+  Com<IUIAutomationElement> element = element_at(window, index, error);
+  if (!element) return false;
+
+  Com<IUIAutomationScrollItemPattern> scroll;
+  if (!pattern(element.get(), UIA_ScrollItemPatternId, &scroll)) {
+    *error = "the control does not scroll";
+    return false;
+  }
+  if (FAILED(scroll->ScrollIntoView())) {
+    *error = "the control refused to scroll";
+    return false;
+  }
+  return true;
+}
+
 bool invoke_element(HWND window, int index, std::string* error) {
   std::string local;
   if (error == nullptr) error = &local;

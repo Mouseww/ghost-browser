@@ -49,6 +49,22 @@ std::vector<Element> find_elements(HWND window, const std::string& role,
 // SendInput wants.
 bool element_center(const Element& element, int* x, int* y);
 
+// Asks the control to scroll itself into view through UI Automation's
+// ScrollItemPattern. For controls that live inside a scrollable region (the
+// common case: a page taller than the window), this is exactly what a person's
+// wheel input does, and it reaches the page as a programmatic scroll, not as
+// synthesized input.
+//
+// Returns false when the control does not advertise the pattern -- a control
+// already fully visible has nothing to scroll, and top-level chrome never
+// carries it -- which the caller treats as "no scroll needed or possible".
+bool scroll_element_into_view(HWND window, int index, std::string* error);
+
+// Maximizes the window so a low-resolution screen or a small restored window
+// cannot clip a challenge dialog that is taller or wider than the client area.
+// Safe to call repeatedly: an already-maximized window stays maximized.
+bool maximize_window(HWND handle, std::string* error);
+
 // Act on a control through UI Automation itself, without synthesizing input.
 //
 // This exists because synthesized input needs a foreground window, and a session

@@ -39,6 +39,10 @@ WindowInfo main_window(DWORD pid);
 // ignores keystrokes sent to a window it does not consider active.
 bool activate_window(HWND handle, std::string* error);
 
+// Maximizes the window (no-op when already maximized) so a challenge dialog
+// taller or wider than the client area still fits on screen.
+bool maximize_window(HWND handle, std::string* error);
+
 // Pixels per CSS pixel for this window (96 dpi == 1.0). UIA rectangles are in
 // physical screen pixels, so this is what converts them to page coordinates.
 double window_scale(HWND handle);

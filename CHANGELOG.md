@@ -41,6 +41,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ships a text challenge behind that button becomes reachable from a foreground session.
   Docs corrected (`docs/USAGE.md`, `docs/ARCHITECTURE.md`) to scope the Invoke dead end
   to no-foreground sessions only.
+- **Clicks to controls outside the window now bring the window to them.** On a
+  low-resolution screen or a small restored window, a challenge dialog can be taller
+  than the client area; its bottom controls (the audio button, the answer field) then
+  sit outside it, and a synthesized click at their desktop coordinates lands on
+  whatever is beside the browser — never on the control. `click_node` now detects a
+  centre outside the client rect and, before falling back to the accessibility
+  channel, scrolls the control into view (UIA ScrollItemPattern, while the walked
+  tree is still honest), maximizes the window, re-reads the tree and re-finds the
+  control by automation id — an index is a position in one walk and any reflow
+  invalidates it; role plus accessible name is the fallback when the id is empty.
+  Verified on a 640×480 window: the audio button reported `offscreen` at y=656 in a
+  592-px client, the click maximized the window to 1918×1038 and the audio challenge
+  opened; the full acceptance suite stayed at **33 checks, 0 failed**.
+- **`captcha` reports the page the challenge lives on, not a leftover.** Chromium keeps
+  a stale `about:blank` document alive beside the real page (observed on DeepSeek's
+  signup page driven through the debugging port), and when both sat at the same depth
+  the empty one won, so `page_url` came back `about:blank` and the service-solve tier
+  built its request on a wrong URL. The page candidate now prefers http(s) documents
+  regardless of depth; the depth tie-break only ranks documents of the same kind.
+  Measured on the DeepSeek signup page: `page_url` now reads
+  `https://platform.deepseek.com/sign_up` where it previously read `about:blank`.
 
 ## [0.9.0] - 2026-10-07
 

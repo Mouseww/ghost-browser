@@ -186,4 +186,20 @@ double window_scale(HWND handle) {
   return static_cast<double>(dpi) / 96.0;
 }
 
+bool maximize_window(HWND handle, std::string* error) {
+  if (handle == nullptr || !IsWindow(handle)) {
+    if (error != nullptr) *error = "no such window";
+    return false;
+  }
+  if (IsZoomed(handle)) return true;  // already maximized: nothing to do
+
+  // ShowWindow's placement path needs the window's thread not to be blocked;
+  // unlike activation there is no foreground lock on resizing your own view of
+  // a window, so this is a plain call plus a settle wait for the layout that
+  // Chromium then re-runs underneath us.
+  ShowWindow(handle, SW_MAXIMIZE);
+  Sleep(250);
+  return IsZoomed(handle) != FALSE;
+}
+
 }  // namespace ghost

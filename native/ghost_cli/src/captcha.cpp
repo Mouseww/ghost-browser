@@ -103,12 +103,21 @@ CaptchaInfo analyze_captcha(const std::vector<Element>& nodes) {
   // "hcaptcha, absent" on a page where the checkbox was still two seconds away.
   size_t page_index = nodes.size();
   int page_depth = 0;
+  bool page_is_real = false;
   for (size_t i = 0; i < nodes.size(); ++i) {
     const Element& e = nodes[i];
     if (e.role != "document") continue;
-    if (page_index == nodes.size() || e.depth < page_depth) {
+    // Chromium keeps a leftover about:blank document alive next to the real page —
+    // observed on DeepSeek's signup page driven through the debugging port, where
+    // both documents sat at the same depth and the earlier one, about:blank, won.
+    // A http(s) URL is always the better page candidate, regardless of depth; the
+    // depth tie-break then only ranks documents of the same kind.
+    const bool real = starts_with(e.value, "http://") || starts_with(e.value, "https://");
+    if (page_index == nodes.size() || (real && !page_is_real) ||
+        (real == page_is_real && e.depth < page_depth)) {
       page_index = i;
       page_depth = e.depth;
+      page_is_real = real;
     }
   }
   if (page_index < nodes.size()) info.page_url = nodes[page_index].value;

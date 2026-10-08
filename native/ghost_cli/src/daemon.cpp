@@ -410,11 +410,84 @@ bool click_node(Session& session, int index, std::string* error) {
     return false;
   }
 
+  // Identity for re-finding the same control after the tree is re-read: an
+  // index is a position in one walk, and anything that reflows the page
+  // invalidates it. The automation id is Chromium's own element id and
+  // survives a reflow; role plus accessible name is the fallback when the id
+  // is empty.
+  const std::string wanted_id = target->automation_id;
+  const std::string wanted_role = target->role;
+  const std::string wanted_name = target->name;
+
   int x = 0;
   int y = 0;
-  const bool reachable = element_center(*target, &x, &y);
+
+  // A click only lands when its coordinates sit inside the window's client
+  // area: outside that, the desktop click hits whatever is beside the
+  // browser, never the control.
+  const auto centre_in_client = [&]() {
+    if (target == nullptr || !element_center(*target, &x, &y)) return false;
+    RECT client{0, 0, 0, 0};
+    if (!GetClientRect(session.window, &client)) return false;
+    POINT top_left{client.left, client.top};
+    POINT bottom_right{client.right, client.bottom};
+    if (!ClientToScreen(session.window, &top_left) ||
+        !ClientToScreen(session.window, &bottom_right)) {
+      return false;
+    }
+    return x >= top_left.x && x < bottom_right.x && y >= top_left.y &&
+           y < bottom_right.y;
+  };
+
+  bool usable = centre_in_client();
+
+  // A low-resolution screen or a small restored window can clip the challenge
+  // dialog: the control's centre then falls outside the client area. Do what
+  // a person does: scroll the control into view while the walked tree is
+  // still the one on screen and the index is honest, make the window as
+  // large as the screen allows, then re-read the tree -- both actions move
+  // everything below them.
+  if (!usable && element_center(*target, &x, &y)) {
+    std::string fit_error;
+    scroll_element_into_view(session.window, index, &fit_error);
+    maximize_window(session.window, &fit_error);
+    std::vector<Element> fresh =
+        dump_tree(session.window, kTreeDepth, kTreeNodes, false, &fit_error);
+    if (fit_error.empty()) {
+      session.last_tree = fresh;
+      int moved = -1;
+      long best_distance = -1;
+      for (const Element& element : session.last_tree) {
+        const bool matches =
+            !wanted_id.empty()
+                ? element.automation_id == wanted_id &&
+                      element.role == wanted_role
+                : element.role == wanted_role && element.name == wanted_name;
+        if (!matches) continue;
+        // Layout order tends to survive a reflow, so among duplicate matches
+        // the walk position closest to the old one is the best guess.
+        const long distance =
+            element.index > index ? element.index - index : index - element.index;
+        if (best_distance < 0 || distance < best_distance) {
+          best_distance = distance;
+          moved = element.index;
+        }
+      }
+      if (moved >= 0) {
+        index = moved;
+        for (const Element& element : session.last_tree) {
+          if (element.index == index) {
+            target = &element;
+            break;
+          }
+        }
+        usable = centre_in_client();
+      }
+    }
+  }
+
   std::string activation_error;
-  if (reachable && activate_window(session.window, &activation_error)) {
+  if (usable && activate_window(session.window, &activation_error)) {
     click_at(x, y, "left", 1);
     session.last_input = "synthesized";
     return true;
@@ -426,7 +499,7 @@ bool click_node(Session& session, int index, std::string* error) {
     return true;
   }
 
-  if (!reachable) {
+  if (!usable) {
     *error = "the control has no visible area, and " + invoke_error;
   } else {
     *error = activation_error +
