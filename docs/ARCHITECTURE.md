@@ -863,6 +863,11 @@ application/x-www-form-urlencoded` 的表单；base64 体解开后 RIFF 头是 `
    `/clip.wav`；而 `document.querySelector('audio').src` 是绝对的。**document 节点自带
    `baseURL`**，所以可以在 C++ 里自己解析（`resolve_url`），**不需要跑任何页面脚本**。
 
+**真机实测**：对 live reCAPTCHA 跑一次，`audio-url` 返回
+`https://www.google.com/recaptcha/api2/payload?p=06AFcWeA...&k=6Le-wvkSAAAAAPBMRTvw0Q4Muexq9bi0DJwx_mJ-`、
+`bytes=38463`，落盘文件头是 `49 44 33`（`ID3`）——**clip 是 MP3**。所以服务路线把它原样上传，
+本机不需要解码器，可执行文件里也就没有链接任何解码器。
+
 实测（`tools\audio_url_check.py`，本地两个源做 stand-in）：**13 checks, 0 failed**。`127.0.0.1`
 的外层页面内嵌 `127.0.0.2` 的 iframe——两个 origin 不同 site，Chromium 真的给了独立渲染进程，
 `Target.getTargets` 能证明这一点，所以 stand-in 覆盖的正是最难的那条路。四个会话分别验：无名帧

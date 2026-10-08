@@ -597,12 +597,17 @@ ghost call --id work "{\"cmd\":\"captcha\",\"action\":\"audio-url\",\"keep\":tru
 ```json
 {
   "found": true,
-  "url": "https://www.google.com/recaptcha/api2/payload?p=...&k=...",
+  "url": "https://www.google.com/recaptcha/api2/payload?p=06AFcWeA7nfaFZ53G-...&k=6Le-wvkSAAAAAPBMRTvw0Q4Muexq9bi0DJwx_mJ-",
   "fetched": true,
-  "bytes": 33431,
-  "path": "C:\\Users\\you\\AppData\\Local\\Temp\\ghost-clip-1234.bin"
+  "bytes": 38463,
+  "path": "C:\\Users\\you\\AppData\\Local\\Temp\\ghost-clip-39012.bin"
 }
 ```
+
+Those numbers are one real measurement against the live reCAPTCHA demo, not an
+illustration. The file begins `49 44 33` — `ID3`, so the clip is an MP3 — which is why
+the service route hands it over untouched: nothing has to decode it here, and no decoder
+is linked into the executable.
 
 Three things make this less obvious than it sounds.
 
