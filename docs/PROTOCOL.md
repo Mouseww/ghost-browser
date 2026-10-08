@@ -314,6 +314,7 @@ Reads the human-verification challenge on the page and, when asked, clicks it.
 | `seconds` | `10` | `solve-audio` only: how long to record, clamped to 2–30 |
 | `language` | `en` | `solve-audio` only: the recogniser language and the solving service's hint |
 | `keep` | `false` | `solve-audio` only: keep the recording and return its path as `wav`, instead of deleting it |
+| `rounds` | `1` | `solve-audio` only: how many audio clips the command is willing to answer in one call, clamped to 1–5. reCAPTCHA often rejects a correct answer once and plays the next clip; a second round answers that clip too instead of reporting a single-round failure |
 
 Returns `provider`, `state`, `detail`, and when they are known `site_key`, `page_url`,
 `frame_url` and `challenge_token`; `solve` adds `clicked`, `input` and `elapsed_ms`.
@@ -353,6 +354,13 @@ window, because every click it makes falls back to the accessibility channel.
   loud. The same list the Windows volume mixer draws.
 - `solved_by` — `local` when the digits came from the machine's speech recogniser,
   `api` when they came from a solving service.
+
+With `rounds` above 1 the command answers up to that many clips in one call: after a
+typed answer fails to clear the challenge it clicks the reload control, re-reads the
+tree (redraws invalidate indexes), and starts the next clip's recording. The reply
+then also carries `rounds_attempted` — how many clips were answered — and `solved`
+reflects the state after the last one. A single-round call keeps the reply shape it
+always had and adds no round fields.
 
 The third tier is off unless a key is configured. There is no built-in key. The key is
 taken from `GHOST_CAPTCHA_KEY`, or from `captcha_api_key` in the profile the server was

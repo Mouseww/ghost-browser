@@ -263,12 +263,33 @@ std::string digits_from(const std::string& text) {
 // An SRGS grammar that admits nothing but a run of digits. Dictation has to
 // choose between every word in the language; this has to choose between ten, so
 // it cannot answer "but 719" to a challenge that said "three seven one nine".
+//
+// The words have to be the recognizer's own. A grammar's items are matched
+// against what the engine emits, and an English engine emits "three", not
+// "三" -- so a word list picked once, in Chinese, turns the digits-only grammar
+// into a no-match machine on every non-Chinese machine, exactly where the audio
+// route is most wanted. The list therefore follows the culture the recognizer
+// reported; a culture nothing here knows gets the literal digits, which every
+// engine can speak in some form and digits_from can always read back.
 std::string digit_grammar_srgs(const std::string& culture) {
   const std::string lang = culture.empty() ? std::string("zh-CN") : culture;
-  static const char* kDigits[] = {"零", "一", "二", "两", "三", "四",
-                                  "五", "六", "七", "八", "九"};
+  const std::string prefix = lower(culture);
+  std::vector<std::string> words;
+  bool en = starts_with(prefix, "en");
+  bool zh = starts_with(prefix, "zh");
+  if (!en && !zh) {
+    // Unknown or missing culture: digits are the only list that is honest for
+    // every engine, and recognize_wav still maps them back through digits_from.
+    for (char c = '0'; c <= '9'; ++c) words.emplace_back(1, c);
+  } else if (en) {
+    words = {"zero", "one", "two", "three", "four",
+             "five", "six", "seven", "eight", "nine"};
+  } else {
+    // zh. 两 is kept beside 二: recognizers emit either for a spoken "2".
+    words = {"零", "一", "二", "两", "三", "四", "五", "六", "七", "八", "九"};
+  }
   std::string items;
-  for (const char* word : kDigits) {
+  for (const std::string& word : words) {
     items += "<item>";
     items += word;
     items += "</item>";

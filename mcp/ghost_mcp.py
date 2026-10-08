@@ -526,6 +526,11 @@ TOOLS = [
                 "keep": {"type": "boolean", "default": False,
                          "description": "keep the solve-audio recording and return its "
                                         "path as 'wav', instead of deleting it"},
+                "rounds": {"type": "integer", "default": 1,
+                           "description": "solve-audio: how many audio clips to answer "
+                                          "in one call, 1-5. reCAPTCHA often rejects a "
+                                          "correct answer once and plays the next "
+                                          "clip; a second round answers that clip too"},
             },
             "additionalProperties": False,
         },
@@ -679,6 +684,7 @@ def run_tool(session: Session, name: str, args: dict) -> dict:
                   "wait_ms": int(args.get("wait_ms", 3000))}
         if action == "solve-audio":
             params["seconds"] = int(args.get("seconds", 10))
+            params["rounds"] = int(args.get("rounds", 1))
             if args.get("language"):
                 params["language"] = args["language"]
             if args.get("keep"):
@@ -725,6 +731,8 @@ def run_tool(session: Session, name: str, args: dict) -> dict:
                 lines.append(f"streams:  {response['streams']}")
             if response.get("solved_by"):
                 lines.append(f"by:       {response['solved_by']}")
+            if response.get("rounds_attempted") is not None:
+                lines.append(f"rounds:   {response['rounds_attempted']}")
             if response.get("heard"):
                 lines.append(f"heard:    {response['heard']}")
             if response.get("confidence") is not None:

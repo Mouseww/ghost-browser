@@ -640,6 +640,15 @@ Json cmd_captcha(Session& session, const Json& request) {
     if (seconds < 2.0) seconds = 2.0;
     if (seconds > 30.0) seconds = 30.0;
 
+    // reCAPTCHA keeps the conversation going: a clip answered incorrectly is
+    // commonly followed by another clip in the same panel, and a caller that
+    // expects that wants the whole exchange handled here instead of one
+    // re-invocation per clip. `rounds` bounds the exchange; the default of 1
+    // leaves the reply exactly what a single listen has always produced.
+    int rounds = static_cast<int>(arg_number(request, "rounds", 1.0));
+    if (rounds < 1) rounds = 1;
+    if (rounds > 5) rounds = 5;
+
     char temp[MAX_PATH] = {0};
     std::string dir = ".";
     if (::GetTempPathA(MAX_PATH, temp) != 0) dir = temp;
@@ -648,156 +657,219 @@ Json cmd_captcha(Session& session, const Json& request) {
                   static_cast<unsigned long>(::GetCurrentProcessId()));
     const std::string wav_path = dir + name;
 
-    // The challenge does not play itself. reCAPTCHA's audio frame keeps the clip
-    // behind its own play control, and until that control is pressed the audio
-    // element holds an open render session that produces nothing -- which is why a
-    // capture taken without this click measures `active peak 0.0000` and is
-    // indistinguishable from a page that simply stayed silent.
-    //
-    // The recorder starts first so that pressing the control lands inside the
-    // capture window rather than before it.
-    CaptureResult captured;
-    std::thread recorder([&captured, seconds, &wav_path]() {
-      captured = capture_loopback(seconds, std::string(), wav_path);
-    });
-    Sleep(300);
+    // The exchange ends from three places -- the challenge resolving itself
+    // between rounds, the refresh click moving it somewhere else, and the
+    // normal tail below -- so the closing fields live here once. `attempted`
+    // below zero keeps `rounds_attempted` out of a reply that never left a
+    // single round.
+    const auto report_end = [&out, &session](const CaptchaInfo& info,
+                                             int attempted) {
+      out.set("state", Json::string(captcha_state_name(info.state)));
+      out.set("detail", Json::string(info.detail));
+      out.set("typed", Json::boolean(true));
+      out.set("input", Json::string(session.last_input));
+      out.set("solved", Json::boolean(info.state == CaptchaState::kSolved));
+      if (attempted >= 0) out.set("rounds_attempted", Json::integer(attempted));
+    };
 
-    const int play_index = latest.play_button_index;
-    if (play_index >= 0) {
-      std::string play_error;
-      if (click_node(session, play_index, &play_error)) {
-        out.set("play", Json::string("pressed the challenge's play control"));
+    for (int round = 1;; ++round) {
+      if (round > 1) {
+        // The watch below can end while the panel is still redrawing, so the
+        // indices the last round used are stale. The tree is read again
+        // before anything is clicked, and one read is confirmed before the
+        // exchange is called over -- a snapshot can land inside a redraw.
+        if (!read_captcha(session, &latest, &error)) return failure(error);
+        if (latest.state != CaptchaState::kAudio) {
+          Sleep(400);
+          if (!read_captcha(session, &latest, &error)) return failure(error);
+        }
+        if (latest.state != CaptchaState::kAudio ||
+            latest.answer_field_index < 0) {
+          report_end(latest, rounds > 1 ? round - 1 : -1);
+          return out;
+        }
+        // Playing the same clip again repeats the same mishearing; the
+        // refresh control is what makes the next round a different question.
+        // The click is best effort: a refused refresh still leaves the replay
+        // path something to listen to.
+        if (latest.refresh_button_index >= 0) {
+          std::string refresh_error;
+          click_node(session, latest.refresh_button_index, &refresh_error);
+          Sleep(800);
+          if (!read_captcha(session, &latest, &error)) return failure(error);
+          if (latest.state != CaptchaState::kAudio ||
+              latest.answer_field_index < 0) {
+            report_end(latest, rounds > 1 ? round - 1 : -1);
+            return out;
+          }
+        }
+      }
+
+      // The challenge does not play itself. reCAPTCHA's audio frame keeps the clip
+      // behind its own play control, and until that control is pressed the audio
+      // element holds an open render session that produces nothing -- which is why a
+      // capture taken without this click measures `active peak 0.0000` and is
+      // indistinguishable from a page that simply stayed silent.
+      //
+      // The recorder starts first so that pressing the control lands inside the
+      // capture window rather than before it.
+      CaptureResult captured;
+      std::thread recorder([&captured, seconds, &wav_path]() {
+        captured = capture_loopback(seconds, std::string(), wav_path);
+      });
+      Sleep(300);
+
+      const int play_index = latest.play_button_index;
+      if (play_index >= 0) {
+        std::string play_error;
+        if (click_node(session, play_index, &play_error)) {
+          out.set("play", Json::string("pressed the challenge's play control"));
+        } else {
+          out.set("play", Json::string("the play control could not be pressed: " + play_error));
+        }
       } else {
-        out.set("play", Json::string("the play control could not be pressed: " + play_error));
+        // A challenge shaped differently, or one that autoplays. Asking for a replay is
+        // the best available way to put the start of the clip inside the window.
+        out.set("play", Json::string("the challenge exposes no play control"));
+        if (latest.refresh_button_index >= 0) {
+          std::string click_error;
+          click_node(session, latest.refresh_button_index, &click_error);
+        }
       }
-    } else {
-      // A challenge shaped differently, or one that autoplays. Asking for a replay is
-      // the best available way to put the start of the clip inside the window.
-      out.set("play", Json::string("the challenge exposes no play control"));
-      if (latest.refresh_button_index >= 0) {
-        std::string click_error;
-        click_node(session, latest.refresh_button_index, &click_error);
+      recorder.join();
+
+      out.set("device", Json::string(captured.device_name));
+      out.set("captured_seconds", Json::number(captured.seconds));
+      out.set("peak", Json::number(captured.peak));
+      out.set("rms", Json::number(captured.rms));
+      // Whether a stream existed at all, which the samples alone cannot say.
+      const std::string streams = stream_summary();
+      out.set("streams", Json::string(streams));
+      if (!captured.ok) {
+        out.set("solved", Json::boolean(false));
+        out.set("detail", Json::string(captured.error));
+        if (rounds > 1) out.set("rounds_attempted", Json::integer(round));
+        return out;
       }
-    }
-    recorder.join();
+      if (captured.peak <= 0.0) {
+        out.set("solved", Json::boolean(false));
+        out.set("detail", Json::string("the challenge played nothing: " +
+                                       captured.device_name + " stayed silent (" +
+                                       streams + ")"));
+        if (rounds > 1) out.set("rounds_attempted", Json::integer(round));
+        return out;
+      }
 
-    out.set("device", Json::string(captured.device_name));
-    out.set("captured_seconds", Json::number(captured.seconds));
-    out.set("peak", Json::number(captured.peak));
-    out.set("rms", Json::number(captured.rms));
-    // Whether a stream existed at all, which the samples alone cannot say.
-    const std::string streams = stream_summary();
-    out.set("streams", Json::string(streams));
-    if (!captured.ok) {
-      out.set("solved", Json::boolean(false));
-      out.set("detail", Json::string(captured.error));
-      return out;
-    }
-    if (captured.peak <= 0.0) {
-      out.set("solved", Json::boolean(false));
-      out.set("detail", Json::string("the challenge played nothing: " +
-                                     captured.device_name + " stayed silent (" +
-                                     streams + ")"));
-      return out;
-    }
-
-    const std::string language = arg_string(request, "language");
-    Transcript transcript = recognize_wav(wav_path, language, true);
-    // Which tier produced the answer. The local engine ships with the machine and
-    // costs nothing, so it always goes first; a service is consulted only when it
-    // had nothing to say, because on a machine with no recognizer for the
-    // challenge's language that is exactly what it will say.
-    std::string solved_by = "local";
-    const SolveApi api = resolve_solve_api(arg_string(request, "key"),
-                                           session.captcha_api_key);
-    if (transcript.digits.empty() && !api.provider.empty()) {
-      // The service wants a small upload, and the render endpoint's 44.1 kHz stereo
-      // is neither small nor necessary for speech.
-      const std::string speech_path = wav_path + ".16k.wav";
-      std::string convert_error;
-      std::string api_digits;
-      std::string api_error;
-      if (!write_speech_wav(speech_path, captured, 16000, &convert_error)) {
-        out.set("api", Json::string(convert_error));
-      } else if (solve_audio_api(api, speech_path,
-                                 language.empty() ? std::string("en") : language,
-                                 &api_digits, &api_error)) {
-        transcript.digits = api_digits;
-        transcript.text = api_digits;
-        transcript.confidence = 1.0;
-        // The local engine's failure has been answered, so it is no longer the
-        // verdict. Leaving `ok` false here would report the local error and never
-        // use the answer the service just gave.
-        transcript.ok = true;
-        transcript.error.clear();
-        solved_by = "api";
+      const std::string language = arg_string(request, "language");
+      Transcript transcript = recognize_wav(wav_path, language, true);
+      // Which tier produced the answer. The local engine ships with the machine and
+      // costs nothing, so it always goes first; a service is consulted only when it
+      // had nothing to say, because on a machine with no recognizer for the
+      // challenge's language that is exactly what it will say.
+      std::string solved_by = "local";
+      const SolveApi api = resolve_solve_api(arg_string(request, "key"),
+                                             session.captcha_api_key);
+      if (transcript.digits.empty() && !api.provider.empty()) {
+        // The service wants a small upload, and the render endpoint's 44.1 kHz stereo
+        // is neither small nor necessary for speech.
+        const std::string speech_path = wav_path + ".16k.wav";
+        std::string convert_error;
+        std::string api_digits;
+        std::string api_error;
+        if (!write_speech_wav(speech_path, captured, 16000, &convert_error)) {
+          out.set("api", Json::string(convert_error));
+        } else if (solve_audio_api(api, speech_path,
+                                   language.empty() ? std::string("en") : language,
+                                   &api_digits, &api_error)) {
+          transcript.digits = api_digits;
+          transcript.text = api_digits;
+          transcript.confidence = 1.0;
+          // The local engine's failure has been answered, so it is no longer the
+          // verdict. Leaving `ok` false here would report the local error and never
+          // use the answer the service just gave.
+          transcript.ok = true;
+          transcript.error.clear();
+          solved_by = "api";
+        } else {
+          out.set("api", Json::string(api_error));
+        }
+        ::DeleteFileA(speech_path.c_str());
+      }
+      out.set("solved_by", Json::string(solved_by));
+      // A failed transcription is the interesting case, and it cannot be diagnosed from
+      // the samples alone -- too quiet, too short and wrong-language all look alike in
+      // the numbers. `keep` leaves the recording behind so the caller can measure it.
+      if (arg_bool(request, "keep", false)) {
+        out.set("wav", Json::string(wav_path));
       } else {
-        out.set("api", Json::string(api_error));
+        ::DeleteFileA(wav_path.c_str());
       }
-      ::DeleteFileA(speech_path.c_str());
-    }
-    out.set("solved_by", Json::string(solved_by));
-    // A failed transcription is the interesting case, and it cannot be diagnosed from
-    // the samples alone -- too quiet, too short and wrong-language all look alike in
-    // the numbers. `keep` leaves the recording behind so the caller can measure it.
-    if (arg_bool(request, "keep", false)) {
-      out.set("wav", Json::string(wav_path));
-    } else {
-      ::DeleteFileA(wav_path.c_str());
-    }
-    if (!transcript.text.empty()) out.set("transcript", Json::string(transcript.text));
-    if (!transcript.digits.empty()) out.set("heard", Json::string(transcript.digits));
-    out.set("confidence", Json::number(transcript.confidence));
-    // Which engine answered. Silence from the wrong language and silence from a bad
-    // recording are the same number, and the culture is what tells them apart.
-    if (!transcript.recognizer.empty()) {
-      out.set("recognizer", Json::string(transcript.recognizer));
-    }
-    if (!transcript.ok) {
-      out.set("solved", Json::boolean(false));
-      out.set("detail", Json::string(transcript.error));
-      return out;
-    }
-    if (transcript.digits.empty()) {
-      out.set("solved", Json::boolean(false));
-      // The capture already proved that sound was there, so an empty transcript is
-      // about the engine, not the audio. Saying which engine makes the difference
-      // between "retry" and "this machine cannot hear this challenge".
-      std::string detail = "the audio held nothing that sounded like digits";
+      if (!transcript.text.empty()) out.set("transcript", Json::string(transcript.text));
+      if (!transcript.digits.empty()) out.set("heard", Json::string(transcript.digits));
+      out.set("confidence", Json::number(transcript.confidence));
+      // Which engine answered. Silence from the wrong language and silence from a bad
+      // recording are the same number, and the culture is what tells them apart.
       if (!transcript.recognizer.empty()) {
-        detail += " (the local recognizer is " + transcript.recognizer +
-                  "; a recognizer for the challenge's language may be needed)";
+        out.set("recognizer", Json::string(transcript.recognizer));
       }
-      out.set("detail", Json::string(detail));
-      return out;
-    }
 
-    std::string answer_error;
-    if (!answer_field(session, latest.answer_field_index, transcript.digits,
-                      &answer_error)) {
-      return failure(answer_error);
-    }
-    Sleep(200);
-    std::string click_error;
-    if (latest.verify_button_index >= 0) {
-      if (!click_node(session, latest.verify_button_index, &click_error)) {
-        return failure(click_error);
+      // A listen that produced no answer is the case another round exists
+      // for: the engine misheard, or the clip was clipped. The remaining
+      // rounds are spent before the failure is reported, and only the last
+      // round reports it.
+      if (!transcript.ok || transcript.digits.empty()) {
+        if (round < rounds) continue;
+        if (!transcript.ok) {
+          out.set("solved", Json::boolean(false));
+          out.set("detail", Json::string(transcript.error));
+          if (rounds > 1) out.set("rounds_attempted", Json::integer(round));
+          return out;
+        }
+        out.set("solved", Json::boolean(false));
+        // The capture already proved that sound was there, so an empty transcript is
+        // about the engine, not the audio. Saying which engine makes the difference
+        // between "retry" and "this machine cannot hear this challenge".
+        std::string detail = "the audio held nothing that sounded like digits";
+        if (!transcript.recognizer.empty()) {
+          detail += " (the local recognizer is " + transcript.recognizer +
+                    "; a recognizer for the challenge's language may be needed)";
+        }
+        out.set("detail", Json::string(detail));
+        if (rounds > 1) out.set("rounds_attempted", Json::integer(round));
+        return out;
       }
-    }
 
-    CaptchaInfo after = latest;
-    const ULONGLONG answered = GetTickCount64();
-    while (GetTickCount64() - answered < 8000) {
-      Sleep(400);
-      if (!read_captcha(session, &after, &error)) break;
-      if (after.state != CaptchaState::kAudio) break;
+      std::string answer_error;
+      if (!answer_field(session, latest.answer_field_index, transcript.digits,
+                        &answer_error)) {
+        return failure(answer_error);
+      }
+      Sleep(200);
+      std::string click_error;
+      if (latest.verify_button_index >= 0) {
+        if (!click_node(session, latest.verify_button_index, &click_error)) {
+          return failure(click_error);
+        }
+      }
+
+      CaptchaInfo after = latest;
+      const ULONGLONG answered = GetTickCount64();
+      while (GetTickCount64() - answered < 8000) {
+        Sleep(400);
+        if (!read_captcha(session, &after, &error)) break;
+        if (after.state != CaptchaState::kAudio) break;
+      }
+      out.set("typed", Json::boolean(true));
+      out.set("input", Json::string(session.last_input));
+      out.set("state", Json::string(captcha_state_name(after.state)));
+      out.set("detail", Json::string(after.detail));
+      out.set("solved", Json::boolean(after.state == CaptchaState::kSolved));
+      if (rounds > 1) out.set("rounds_attempted", Json::integer(round));
+      // Solved, or the widget changed shape, or the allowed listens are spent:
+      // the reply is final. Still audio means the answer did not take, and
+      // another round has been asked for.
+      if (after.state != CaptchaState::kAudio || round >= rounds) return out;
     }
-    out.set("typed", Json::boolean(true));
-    out.set("input", Json::string(session.last_input));
-    out.set("state", Json::string(captcha_state_name(after.state)));
-    out.set("detail", Json::string(after.detail));
-    out.set("solved", Json::boolean(after.state == CaptchaState::kSolved));
-    return out;
   }
 
   // Then watch the rest of the way. The widget disappearing means it was answered;

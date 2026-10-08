@@ -622,12 +622,21 @@ This is a vertical slice, not a finished product. Not built yet:
 - **hCaptcha's audio route is not driven, and that is a measured dead end rather than
   an oversight.** The challenge frame does expose a button named `About hCaptcha &
   Accessibility Options` (with no automation id), and hCaptcha's own image alt text
-  points at it for "Get Cookie" and "Text Challenge". But activating it through UI
-  Automation changes nothing in the tree for ten seconds, while the *same* invoke
-  pattern works on hCaptcha's checkbox — so the obstacle is that the menu button is a
-  custom element that does not respond to the pattern, not that the route was missed.
-  A real mouse event might work; that needs a foreground-capable session, which this
-  machine's RDP session does not have. See `docs/ARCHITECTURE.md` §14.6.
+  points at it for "Get Cookie" and "Text Challenge". Two click channels reach it, with
+  different outcomes:
+  - Through UI Automation's invoke pattern — the channel every no-foreground session
+    falls back to — nothing in the tree changes for ten seconds, while the *same*
+    invoke pattern works on hCaptcha's checkbox: the menu button is a custom element
+    that does not respond to the pattern.
+  - A synthesized (SendInput) click — which needs a foreground-capable session — opens
+    the menu in about one second. In the build measured on 2026-10-08 the menu holds
+    four items (`可访问性：检索 Cookie`, `向 hCaptcha 举报图片`, `向 hCaptcha 报告错误`,
+    `关于 hCaptcha 的信息`) and none of them is a solvable challenge: cookie retrieval
+    needs an accessibility cookie the browser does not have, and this build offers no
+    text-challenge item. So the route is closed by what is *inside* the menu, not by
+    the menu being unreachable — a future hCaptcha build that ships a text challenge
+    behind this button would be reachable from a foreground session.
+  See `docs/ARCHITECTURE.md` §14.6.
 - **Windows x64 only.** Linux and macOS are designed in §8 and not implemented.
 - **No canvas / audio / font-metric spoofing.** Canvas hashing, audio
   fingerprinting and font metrics are still measured from the real machine. See
