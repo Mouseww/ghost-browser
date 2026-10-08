@@ -32,7 +32,7 @@ needed to work on the source or run the fingerprint test page under `harness/`.
 | WebGL vendor / renderer (`UNMASKED_*`) | **working** — via DXGI adapter identity |
 | Font enumeration (`document.fonts`, `measureText`) | **working** — DirectWrite collection filtered |
 | Control plane (`ghost serve`) | **working** — 19 checks, named pipe, no TCP port |
-| DevTools channel (anonymous pipe, on by default) | **working** — no port, no `DevToolsActivePort` in the profile, `navigator.webdriver` still false |
+| DevTools channel (anonymous pipe, on by default) | **working** — 10 checks, no TCP port, no `DevToolsActivePort` in the profile, `navigator.webdriver` still false |
 | Working with no foreground window | **working** — falls back to UI Automation and says which channel it used |
 | Reading a human-verification challenge | **working** — 35 checks |
 | Waiting for a challenge without touching it | **working** — `captcha action=wait` |
@@ -424,6 +424,7 @@ fresh Chrome launched by `ghost_launch`:
 | `navigator.webdriver` | false | false | pass |
 | Automation globals (`cdc_*`, `__playwright__`, …) | none | none | pass |
 | CDP ports 9222/9223/9229/9515 | closed | all closed | pass |
+| Any listening TCP port owned by the browser | none | none | pass |
 | `DevToolsActivePort` in the profile | absent | absent | pass |
 | Hooked getters still report `[native code]` | yes | yes | pass |
 | `UNMASKED_VENDOR_WEBGL` | NVIDIA | NVIDIA | pass |
@@ -433,6 +434,14 @@ fresh Chrome launched by `ghost_launch`:
 The harness asserts the adapter description and the `(0x…)` device id **separately** rather
 than matching one hardcoded literal, so a change in ANGLE's string format cannot silently
 turn the check into a false pass.
+
+The two DevTools rows are measured by `tools/port_check.py`, which asks the channel for
+`Browser.getVersion` **before** it reads the port table. That order matters: a browser which
+never opened the channel also listens on no port, so without the first question an empty
+port list would prove nothing. It reads 10 chrome processes and zero listening TCP ports,
+then searches the profile of that same *used* session for anything named `DevTools*` and
+finds none. A session started with `--no-cdp` is measured the same way and additionally has
+to refuse a DevTools request rather than quietly opening one.
 
 ---
 
@@ -528,6 +537,8 @@ tools/
   mcp_check.py             MCP acceptance
   captcha_check.py         the three real challenges, end to end
   token_check.py           the solving-service token route, against a stand-in service
+  audio_url_check.py       the audio clip's own URL, against a two-origin stand-in
+  port_check.py            the DevTools channel has no port and leaves no trace
   verify_ghost.ps1         proves ghost.exe is self-contained
   pe_exports.py            dependency-free PE export-table parser
   token_sids.ps1           process token / integrity / restricted-SID dumper

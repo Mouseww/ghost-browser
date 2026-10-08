@@ -551,8 +551,11 @@ WebGL 从「必须重编引擎」降级为「Track A 即可」，大幅缩小了
 的注释——`chrome_main_delegate.cc:1221-1233` 在 `--remote-debugging-pipe` 存在时会跳过
 描述符检查），所以：
 
-- **没有 TCP 端口**可被页面扫描；
-- **profile 里不写 `DevToolsActivePort`**（实测：整个 profile 目录递归查找无 `DevTools*` 文件）；
+- **没有 TCP 端口**可被页面扫描（`tools/port_check.py` 实测：10 个 chrome 进程、监听端口
+  列表为空。该脚本先问 `Browser.getVersion` 再读端口表，顺序是必须的——「没开通道的浏览器
+  同样没有端口」，不问这一句，空列表什么也证明不了）；
+- **profile 里不写 `DevToolsActivePort`**（同一脚本对**已被使用过**的那个 profile 递归查找，
+  `DevTools*` 条目为空）；
 - 只用 `Runtime.evaluate` 与 `DOM.getDocument`，**两者都不需要先 `enable`**。
 
 代价与修法：打开该管道会连带打开 Blink 的 `AutomationControlled` 特性，把

@@ -5,6 +5,20 @@ All notable changes to this project are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`tools/port_check.py`: acceptance for "the DevTools channel is not a port".** The
+  claim has two halves, so the script measures both instead of asserting them: the
+  browser's own processes listen on no TCP port, and no `DevTools*` file appears under
+  the profile of a session that has actually been driven. It asks the channel for
+  `Browser.getVersion` **first**, because a browser that never opened the channel also
+  listens on no port — without that question the empty port list would prove nothing.
+  Measured: 10 chrome processes, zero listening ports, no `DevTools*` entry of any kind,
+  and a `--no-cdp` session that both stays portless and refuses a DevTools request.
+  10 checks, 0 failed.
+
 ## [0.12.0] - 2026-10-09
 
 ### Added
