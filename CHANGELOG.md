@@ -5,6 +5,47 @@ All notable changes to this project are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] - 2026-10-09
+
+### Added
+
+- **`captcha action=audio-url`: the challenge's own clip, read and fetched.** The
+  audio route used to mean one thing — record what the machine plays and transcribe
+  it — which needs a sound card and, in practice, a recogniser for the challenge's
+  language. A solving service needs neither: it wants the file. So this action reads
+  the address of the clip the challenge is about to play and downloads it. `solve-audio`
+  now takes this route first whenever a service key is configured, and falls back to
+  recording when there is no key, when the clip is a `blob:` URL that only the page can
+  read, or when the fetch fails.
+- **`captcha` reaches a frame with a process of its own.** The clip is almost never in
+  the page's own tree, because reCAPTCHA's audio frame is a separate target. The command
+  asks the browser for its targets and attaches to the frames directly. Frames whose
+  address names a known vendor are tried first and the rest after them, because the set
+  of vendors is not something this code gets to decide.
+- **`ghost_cdp`'s `session` accepts a session id you already hold**, which is what makes
+  `Target.attachToTarget` usable from outside; previously anything but `"browser"` was
+  forced to the page scope. `captcha action=audio-url` is built on exactly this.
+
+### Fixed
+
+- **A relative `src` is resolved before it is fetched.** The DevTools DOM tree hands
+  back an attribute exactly as it was authored, so a clip declared as `/clip.wav`
+  arrived as `/clip.wav`. The document node carries `baseURL`, so the command resolves
+  against that itself — no page script runs, and `Runtime.enable` is still never called.
+  Found by a probe that compared the tree's `attributes` against the page's own
+  `querySelector('audio').src`.
+- **The frame search is no longer a closed set.** The first version attached only to
+  frames whose address contained a vendor's name, so a stand-in frame on a second origin
+  was invisible and the fallback path silently never ran. It now tries every frame
+  target, named ones first.
+
+### Verified
+
+- `tools/audio_url_check.py` — 13 checks, 0 failed, against a local stand-in: a frame on
+  a second origin (a real out-of-process frame, proven by `Target.getTargets`), a frame
+  named like a vendor's, a page with no audio element at all, and a `--no-cdp` session
+  that must refuse honestly.
+
 ## [0.11.0] - 2026-10-09
 
 ### Added

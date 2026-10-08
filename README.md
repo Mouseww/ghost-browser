@@ -34,11 +34,11 @@ needed to work on the source or run the fingerprint test page under `harness/`.
 | Control plane (`ghost serve`) | **working** — 19 checks, named pipe, no TCP port |
 | DevTools channel (anonymous pipe, on by default) | **working** — no port, no `DevToolsActivePort` in the profile, `navigator.webdriver` still false |
 | Working with no foreground window | **working** — falls back to UI Automation and says which channel it used |
-| Reading a human-verification challenge | **working** — 33 checks |
+| Reading a human-verification challenge | **working** — 35 checks |
 | Waiting for a challenge without touching it | **working** — `captcha action=wait` |
 | Clearing Cloudflare Turnstile | **working** — one click answers it |
 | hCaptcha / reCAPTCHA image challenges | **answered by a solving service** — `captcha action=solve-token` supplies the DOM write, not the recognition |
-| reCAPTCHA audio challenge | **recorded, transcribed and answered** — locally, or by a service when no recogniser fits |
+| reCAPTCHA audio challenge | **answered two ways** — from the clip's own URL when a service is configured, otherwise recorded and transcribed |
 | hCaptcha audio challenge | **not driven** — a measured dead end: its menu button ignores UI Automation |
 | Window branding (title, icon, taskbar) | **working** |
 | Reading cookies while the browser runs | **impossible** — Chrome holds the file unshared |
@@ -210,8 +210,7 @@ claude mcp add ghost -- python /absolute/path/to/mcp/ghost_mcp.py
 
 [mcp/README.md](mcp/README.md) has the generic `mcpServers` JSON, the tool table and
 the environment variables. `python tools/mcp_check.py` drives the whole thing the way
-a client does and reports **35 checks, 0 failed** (1 not measurable without a
-foreground window).
+a client does and reports **36 checks, 0 failed**.
 
 **The skill** ([skills/ghost/SKILL.md](skills/ghost/SKILL.md)) supplies the judgement:
 when this browser is the right tool and when an HTTP client is, the
@@ -239,7 +238,7 @@ ghost call '{"cmd":"captcha","action":"detect"}' --id agent
  "detail": "the widget is showing its checkbox"}
 ```
 
-Measured against the three real challenges (`python tools/captcha_check.py` → **33 checks,
+Measured against the three real challenges (`python tools/captcha_check.py` → **35 checks,
 0 failed, 0 not measurable**):
 
 | Challenge | What the browser does |
@@ -248,11 +247,14 @@ Measured against the three real challenges (`python tools/captcha_check.py` → 
 | hCaptcha | reads the sitekey, clicks, opens the image challenge |
 | reCAPTCHA v2 | reads the sitekey, clicks, opens the challenge; the audio challenge is reachable, recorded and answered |
 
-The audio route needs no CDP and no injected script either. It records what the browser
-**actually played** through a WASAPI loopback of the output device, presses the
-challenge's own play control (the challenge does not start itself), transcribes the
-digits and types them back. Nothing is downloaded and no URL is parsed, so it does not
-depend on the challenge's internal structure:
+The audio route has two forms. On the machine it records what the browser **actually
+played** through a WASAPI loopback of the output device, presses the challenge's own play
+control (the challenge does not start itself), transcribes the digits and types them
+back — nothing is downloaded and no URL is parsed, so it does not depend on the
+challenge's internal structure. When a solving service is configured it instead reads the
+clip's own address out of the page and fetches it (`captcha action=audio-url`), which
+needs neither the sound card nor a recogniser. The clip usually lives in a frame with a
+process of its own, which is why the page's own tree does not contain it:
 
 ```json
 {"ok": true, "provider": "recaptcha", "state": "audio",
@@ -307,8 +309,9 @@ an open stream that renders nothing, which is why `play` and `streams` are repor
 alongside the level. And **do not retry in a loop**: repeated attempts are themselves a
 bot signal. Ask once, report what you got, move on.
 
-What is *not* done: solving the image challenge, and driving hCaptcha's audio route,
-which goes through its accessibility menu.
+What is *not* done: recognising an image challenge here — a solving service answers it,
+this browser does not — and driving hCaptcha's audio route, which goes through its
+accessibility menu.
 
 ### The window says "Ghost Browser"
 

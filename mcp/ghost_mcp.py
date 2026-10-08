@@ -45,7 +45,7 @@ PROTOCOL_VERSION = "2025-06-18"
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 
 SERVER_NAME = "ghost"
-SERVER_VERSION = "0.11.0"
+SERVER_VERSION = "0.12.0"
 
 DEFAULT_ID = os.environ.get("GHOST_ID") or "mcp"
 READY_TIMEOUT = float(os.environ.get("GHOST_TIMEOUT") or 60)
@@ -510,14 +510,18 @@ TOOLS = [
             "widget would have produced and writes it straight into the page's hidden "
             "response field, then submits the form — this is the only route that "
             "answers an image challenge, and it needs a solving service and a session "
-            "with the DevTools pipe (that is, not one started with --no-cdp)."
+            "with the DevTools pipe (that is, not one started with --no-cdp). With "
+            "action='audio-url' it reads the audio challenge's own clip address out of "
+            "the page, including out of a frame that has a process of its own, and "
+            "fetches it. That is the route solve-audio takes when a solving service is "
+            "configured, so neither the sound card nor the local recogniser is needed."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "action": {"type": "string",
                            "enum": ["detect", "solve", "solve-audio", "solve-token",
-                                    "wait"],
+                                    "audio-url", "wait"],
                            "default": "solve"},
                 "timeout": {"type": "integer", "default": 30000,
                             "description": "milliseconds to keep watching"},
@@ -540,6 +544,9 @@ TOOLS = [
                 "key": {"type": "string",
                         "description": "solve-token: the solving service's API key, "
                                        "overriding GHOST_CAPTCHA_KEY and the profile"},
+                "path": {"type": "string",
+                         "description": "audio-url: where to write the fetched clip, "
+                                        "instead of a temporary file"},
             },
             "additionalProperties": False,
         },
@@ -566,9 +573,11 @@ TOOLS = [
                 "params": {"type": "object",
                            "description": "the method's parameters, passed through "
                                           "unchanged"},
-                "session": {"type": "string", "enum": ["page", "browser"],
-                            "default": "page",
-                            "description": "page-scoped (default) or browser-scoped"},
+                "session": {"type": "string", "default": "page",
+                            "description": "page-scoped (default), browser-scoped "
+                                           "('browser'), or a session id you already "
+                                           "hold from Target.attachToTarget — which is "
+                                           "how a frame in its own process is reached"},
             },
             "additionalProperties": False,
         },
@@ -730,17 +739,32 @@ def run_tool(session: Session, name: str, args: dict) -> dict:
         if action == "solve-token":
             if args.get("key"):
                 params["key"] = args["key"]
+        if action == "audio-url" and args.get("path"):
+            params["path"] = args["path"]
         response = session.call("captcha", **params)
         provider = response.get("provider", "none")
         state = response.get("state", "?")
         # The token route reads the document rather than the tree, so a widget the
         # tree could not describe is not a reason to call it off.
-        if provider == "none" and action != "solve-token":
+        if provider == "none" and action not in ("solve-token", "audio-url"):
             if action == "wait":
                 return tool_result(
                     "no human-verification challenge appeared within "
                     f"{response.get('waited_ms', 0)} ms of watching")
             return tool_result("no human-verification challenge on this page")
+
+        if action == "audio-url":
+            if not response.get("found"):
+                why = response.get("detail") or "the page holds no audio element"
+                return tool_result(f"no audio clip was reachable: {why}")
+            lines = [f"clip:    {response.get('url')}"]
+            if response.get("bytes") is not None:
+                lines.append(f"bytes:   {response['bytes']}")
+            if response.get("path"):
+                lines.append(f"kept at: {response['path']}")
+            if response.get("detail"):
+                lines.append(f"note:    {response['detail']}")
+            return tool_result("\n".join(lines))
 
         if action == "solve-token":
             lines = []

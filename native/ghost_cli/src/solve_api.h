@@ -48,6 +48,19 @@ bool solve_recaptcha_api(const SolveApi& api, const std::string& site_key,
                          const std::string& page_url, std::string* token,
                          std::string* error);
 
+// Fetches a URL into a file, following redirects.
+//
+// This is the other half of the audio tier. A challenge's clip is normally
+// reachable as a plain HTTPS GET long before it is ever played, and taking it from
+// there skips the render-endpoint capture and the local transcription entirely --
+// which is worth doing because a capture has to guess when playback started and
+// reports "played nothing" when it guesses wrong. The service accepts the clip in
+// whatever container it arrives in, so nothing here inspects the bytes.
+//
+// `bytes` receives the size written. On failure the partial file is removed.
+bool download_to_file(const std::string& url, const std::string& path,
+                      long long* bytes, std::string* error);
+
 // Standard base64, no line breaks. Exposed because the request body needs it and
 // there is no reason for a second copy of it to exist.
 std::string base64_encode(const unsigned char* data, size_t size);

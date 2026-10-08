@@ -544,7 +544,8 @@ WebGL 从「必须重编引擎」降级为「Track A 即可」，大幅缩小了
 ### 12.8 DevTools 通道：默认开启，管道而非端口
 
 零 CDP 的承诺实测下来有两处**替代通道补不上**：隐藏表单字段写不进去，`<audio>` 元素
-自己的 URL 读不到。前者正好是第三方打码服务返回 token 的落点，所以自 0.11.0 起
+自己的 URL 读不到。后者自 0.12.0 起也用上了（`captcha action=audio-url`，见 §14.7），
+走的是同一个管道；前者正好是第三方打码服务返回 token 的落点，所以自 0.11.0 起
 `ghost` 默认打开 `--remote-debugging-pipe`：**句柄由启动器创建后传给子进程**
 （`--remote-debugging-io-pipes=<read>,<write>`，见 `native/ghost_cli/src/launch.cpp:60-97`
 的注释——`chrome_main_delegate.cc:1221-1233` 在 `--remote-debugging-pipe` 存在时会跳过
@@ -552,7 +553,7 @@ WebGL 从「必须重编引擎」降级为「Track A 即可」，大幅缩小了
 
 - **没有 TCP 端口**可被页面扫描；
 - **profile 里不写 `DevToolsActivePort`**（实测：整个 profile 目录递归查找无 `DevTools*` 文件）；
-- 只用 `Runtime.evaluate`，**不调 `Runtime.enable`**。
+- 只用 `Runtime.evaluate` 与 `DOM.getDocument`，**两者都不需要先 `enable`**。
 
 代价与修法：打开该管道会连带打开 Blink 的 `AutomationControlled` 特性，把
 `navigator.webdriver` 变成 `true`。启动器把 `AutomationControlled` **合并进**调用方已有的
@@ -807,7 +808,9 @@ mask 恢复默认后 `19 checks, 0 failed`。**证明移除它们的就是字体
 ## 14.7 第三级：把采集到的音频交给第三方解题服务
 
 第二级只被语言卡住，所以第三级不是「另一条采集路线」，而是**同一份录音的另一个去向**：本地识别
-失败且配置了 key 时，把环回采到的音频交给 2captcha 一类的服务转写。
+失败且配置了 key 时，把环回采到的音频交给 2captcha 一类的服务转写。**0.12.0 起还有更短的一条**：
+既然服务要的是文件而不是声音，那就别录了——直接问页面要那段 clip 的地址（§14.8），这条路连声卡
+都不需要。
 
 上传的不是原始录音。渲染端点给的是 44.1 kHz 立体声，既超出语音识别所需，也大到不必上传，所以
 `write_speech_wav`（`native\ghost_cli\src\audio_capture.cpp`）一遍完成混单声道与线性重采样，写出
@@ -817,7 +820,7 @@ mask 恢复默认后 `19 checks, 0 failed`。**证明移除它们的就是字体
 |---|---|
 | `native\ghost_cli\src\solve_api.cpp` | WinHTTP 客户端：`POST /in.php`（`method=audio`，体是 url 编码后的 base64）拿任务号，再每 5 秒 `GET /res.php` 轮询，`CAPCHA_NOT_READY` 视为继续等，最长 120 秒 |
 | `native\ghost_cli\src\solve_api.h` | `resolve_solve_api`：URL 取 `GHOST_CAPTCHA_URL`（默认 `https://2captcha.com`），key 依次取 显式参数 → `GHOST_CAPTCHA_KEY` → profile 的 `captcha_api_key` |
-| `native\ghost_cli\src\daemon.cpp` | `solve-audio`：先本地识别，只有在它没拿到数字**且**配了 key 时才走服务，并在回应里如实标注 `solved_by` 是 `local` 还是 `api` |
+| `native\ghost_cli\src\daemon.cpp` | `solve-audio`：配了 key 时先试 §14.8 的 URL 路线，否则本地识别；两条都拿不到数字且配了 key 时才把录音交给服务，并在回应里如实标注 `solved_by` 是 `local` 还是 `api` |
 
 选 WinHTTP 而不是 WinINet，是因为进程可能处于受限令牌或模拟身份之下，而 WinINet 的按用户会话状态
 正是那种会静默失败的东西。**没有内置 key，也不会有**：未配置时 `provider` 为空，第三级是「关闭」
@@ -840,5 +843,34 @@ application/x-www-form-urlencoded` 的表单；base64 体解开后 RIFF 头是 `
 `transcript.ok`，于是后面 `if (!transcript.ok)` 的提前返回照常触发，服务给的答案**从未被输入页面**
 （表现是 `heard` 有值而 `typed=None`）。**一个「成功」的分支必须把整份判定状态一起改掉，只改它自己
 写的那几个字段，等于没改。**
+
+## 14.8 `captcha action=audio-url`：直接读挑战自己的 clip 地址
+
+服务要的是音频文件，而音频文件的地址页面自己最清楚。所以 0.12.0 加了一条独立动作：把挑战即将
+播放的那段音频的地址读出来并下载，`solve-audio` 在配了 key 时先走它。
+
+三个实测出来的细节决定了实现：
+
+1. **clip 通常不在页面的 DOM 树里。** reCAPTCHA 的音频帧是独立 target：对 page session 调
+   `DOM.getDocument {depth:-1, pierce:true}` 遍历整棵树，`AUDIO`/`SOURCE` 节点数是 **0**；
+   `Target.getTargets` 里能看到那个 iframe，`Target.attachToTarget {targetId, flatten:true}`
+   之后在返回的 sessionId 上再取一次树，才拿到 **1 个** AUDIO 节点。所以 `read_audio_url`
+   先试页面树，再退到「逐个 attach 所有 iframe target」。
+2. **过滤不能是白名单。** 第一版只 attach 地址里含 `recaptcha`/`hcaptcha`/
+   `challenges.cloudflare.com` 的帧——这是闭集缺陷，我自己写的 stand-in 帧就是反例。现在按
+   「先命名厂商帧、再其余帧」排序后逐个试，上限 12 个。**厂商名单不是这段代码有资格决定的。**
+3. **CDP 给的是属性的原文，不是解析后的 URL。** 帧里写 `src="/clip.wav"`，树里就是
+   `/clip.wav`；而 `document.querySelector('audio').src` 是绝对的。**document 节点自带
+   `baseURL`**，所以可以在 C++ 里自己解析（`resolve_url`），**不需要跑任何页面脚本**。
+
+实测（`tools\audio_url_check.py`，本地两个源做 stand-in）：**13 checks, 0 failed**。`127.0.0.1`
+的外层页面内嵌 `127.0.0.2` 的 iframe——两个 origin 不同 site，Chromium 真的给了独立渲染进程，
+`Target.getTargets` 能证明这一点，所以 stand-in 覆盖的正是最难的那条路。四个会话分别验：无名帧
+（回落路径，做全部断言）、命名成 `/recaptcha/bframe` 的帧（厂商路径）、没有 audio 元素的页面
+（`found:false`）、`--no-cdp` 会话（`found:false` 且说明缺的是哪条通道）。下载到的字节数与
+sha256 与源文件逐字节一致。
+
+`blob:` 与 `data:` 地址是诚实的边界：它们住在渲染进程里，页面之外没有任何东西能取到，所以
+`found` 为真而 `fetched` 为假，`detail` 说明原因，`solve-audio` 随之回落到环回采集。
 
 

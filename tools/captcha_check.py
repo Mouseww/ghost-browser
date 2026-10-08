@@ -239,6 +239,23 @@ def run_target(checks: Checks, name: str, url: str, timeout: float,
                     checks.true(f"{name}: the challenge token is read",
                                 bool(detected.get("challenge_token") or
                                      audio.get("challenge_token")))
+
+                    # The clip behind the challenge is reachable as a URL, and that
+                    # is the route which lets a solving service answer it without the
+                    # sound card or the local recogniser. Google refuses this network
+                    # often enough that a missing clip is not a product failure, so
+                    # that outcome is reported rather than asserted.
+                    clip = ghost.call("captcha", action="audio-url")
+                    if clip.get("found"):
+                        checks.true(f"{name}: the clip's own URL is reachable",
+                                    str(clip.get("url", "")).startswith("http"),
+                                    f"url: {clip.get('url')}")
+                        checks.true(f"{name}: the clip was fetched",
+                                    clip.get("fetched"),
+                                    f"detail: {clip.get('detail', '')}")
+                    else:
+                        checks.gap(f"{name}: the clip's own URL is reachable",
+                                   clip.get("detail") or "no audio element on the page")
                 else:
                     checks.gap(f"{name}: the audio button is reachable",
                                "the challenge frame did not expose it")

@@ -339,6 +339,19 @@ Json cmd_find(Session& session, const Json& request) {
   return out;
 }
 
+// Where every scratch file this process writes goes: %TEMP%\<stem>-<pid>.<ext>.
+// The pid is in the name because two browsers can be driven at once, and the
+// second one must not overwrite the first one's recording mid-listen.
+std::string temp_path(const char* stem, const char* extension) {
+  char temp[MAX_PATH] = {0};
+  std::string dir = ".";
+  if (::GetTempPathA(MAX_PATH, temp) != 0) dir = temp;
+  char name[64];
+  std::snprintf(name, sizeof(name), "%s-%lu.%s", stem,
+                static_cast<unsigned long>(::GetCurrentProcessId()), extension);
+  return dir + name;
+}
+
 // Reads the human-verification challenge on the page, clicks its checkbox when
 // that is what it is waiting for, and reports what happened.
 //
@@ -756,6 +769,11 @@ Json captcha_solve_token(Session& session, const Json& request, const CaptchaInf
   return out;
 }
 
+// Defined further down, next to the DevTools command it is built on. The audio
+// tier reaches for it before any of the tree reading below, because a clip is a
+// property of the page rather than of a widget the tree has recognised.
+bool read_audio_url(Session& session, std::string* url, std::string* error);
+
 Json cmd_captcha(Session& session, const Json& request) {
   std::string error;
   if (!refresh(session, &error)) return failure(error);
@@ -767,6 +785,58 @@ Json cmd_captcha(Session& session, const Json& request) {
   // wants one sample can pass `wait_ms: 0` and get the old behaviour.
   const int wait_ms = static_cast<int>(arg_number(request, "wait_ms", 3000));
   const ULONGLONG command_start = GetTickCount64();
+
+  // The clip behind an audio challenge, taken from the page rather than from the
+  // sound card.
+  //
+  // This is its own action because it is the capability the audio tier is built
+  // on, and a caller that wants to know whether the clip is reachable should not
+  // have to make the browser play something first. It runs before any tree
+  // reading: an audio element is a property of the document, not of a widget the
+  // accessibility tree has recognised, so requiring a challenge to be visible
+  // first would refuse exactly the pages this is for.
+  if (action == "audio-url") {
+    std::string url;
+    std::string url_error;
+    if (!read_audio_url(session, &url, &url_error)) {
+      Json missed = success();
+      missed.set("found", Json::boolean(false));
+      missed.set("detail", Json::string(url_error));
+      return missed;
+    }
+
+    Json out = success();
+    out.set("found", Json::boolean(true));
+    out.set("url", Json::string(url));
+    if (url.rfind("blob:", 0) == 0 || url.rfind("data:", 0) == 0) {
+      out.set("fetched", Json::boolean(false));
+      out.set("detail", Json::string(
+                            "the clip lives in the renderer as a " +
+                            url.substr(0, url.find(':')) +
+                            " URL, which nothing outside the page can fetch"));
+      return out;
+    }
+
+    const std::string given = arg_string(request, "path");
+    const std::string path = given.empty() ? temp_path("ghost-clip", "bin") : given;
+    long long bytes = 0;
+    std::string download_error;
+    if (!download_to_file(url, path, &bytes, &download_error)) {
+      out.set("fetched", Json::boolean(false));
+      out.set("detail", Json::string(download_error));
+      return out;
+    }
+    out.set("fetched", Json::boolean(true));
+    out.set("bytes", Json::integer(bytes));
+    // The clip is a recording of a person's voice, so it is deleted unless the
+    // caller asked to keep it -- the same rule the loopback recording follows.
+    if (arg_bool(request, "keep", false)) {
+      out.set("path", Json::string(path));
+    } else {
+      ::DeleteFileA(path.c_str());
+    }
+    return out;
+  }
 
   std::vector<Element> nodes = dump_tree(session.window, kTreeDepth, kTreeNodes, false, &error);
   if (!error.empty()) return failure(error);
@@ -886,12 +956,16 @@ Json cmd_captcha(Session& session, const Json& request) {
     }
   }
 
-  // The audio tier: answer a spoken challenge with what the sound card heard.
+  // The audio tier: answer a spoken challenge.
   //
-  // Nothing below reads the audio URL or reaches into the page. The samples come
-  // off the render endpoint, which is where the browser put them, and the only
-  // thing that goes back into the page is a typed answer -- so this runs under
-  // exactly the same zero-CDP rule as the click does.
+  // The answer comes from one of two places, and the reply says which. The
+  // challenge's own clip is reachable as a URL, and when a solving service is
+  // configured that clip is fetched and handed straight over -- no capture, no
+  // transcription, and no synthesized input anywhere in the path. When the clip
+  // cannot be reached, or nothing would be able to read it, the samples come off
+  // the render endpoint, which is where the browser put them, and the local
+  // engine or the service reads those instead. Either way the only thing that
+  // goes back into the page is a typed answer.
   if (action == "solve-audio") {
     // No upfront foreground requirement: the samples come off the render
     // endpoint and the answer can go in through accessibility, so this tier runs
@@ -992,104 +1066,156 @@ Json cmd_captcha(Session& session, const Json& request) {
         }
       }
 
-      // The challenge does not play itself. reCAPTCHA's audio frame keeps the clip
-      // behind its own play control, and until that control is pressed the audio
-      // element holds an open render session that produces nothing -- which is why a
-      // capture taken without this click measures `active peak 0.0000` and is
-      // indistinguishable from a page that simply stayed silent.
+      // Where the answer comes from, tried in this order.
       //
-      // The recorder starts first so that pressing the control lands inside the
-      // capture window rather than before it.
-      CaptureResult captured;
-      std::thread recorder([&captured, seconds, &wav_path]() {
-        captured = capture_loopback(seconds, std::string(), wav_path);
-      });
-      Sleep(300);
-
-      const int play_index = latest.play_button_index;
-      if (play_index >= 0) {
-        std::string play_error;
-        if (click_node(session, play_index, &play_error)) {
-          out.set("play", Json::string("pressed the challenge's play control"));
-        } else {
-          out.set("play", Json::string("the play control could not be pressed: " + play_error));
-        }
-      } else {
-        // A challenge shaped differently, or one that autoplays. Asking for a replay is
-        // the best available way to put the start of the clip inside the window.
-        out.set("play", Json::string("the challenge exposes no play control"));
-        if (latest.refresh_button_index >= 0) {
-          std::string click_error;
-          click_node(session, latest.refresh_button_index, &click_error);
-        }
-      }
-      recorder.join();
-
-      out.set("device", Json::string(captured.device_name));
-      out.set("captured_seconds", Json::number(captured.seconds));
-      out.set("peak", Json::number(captured.peak));
-      out.set("rms", Json::number(captured.rms));
-      // Whether a stream existed at all, which the samples alone cannot say.
-      const std::string streams = stream_summary();
-      out.set("streams", Json::string(streams));
-      if (!captured.ok) {
-        out.set("solved", Json::boolean(false));
-        out.set("detail", Json::string(captured.error));
-        if (rounds > 1) out.set("rounds_attempted", Json::integer(round));
-        return out;
-      }
-      if (captured.peak <= 0.0) {
-        out.set("solved", Json::boolean(false));
-        out.set("detail", Json::string("the challenge played nothing: " +
-                                       captured.device_name + " stayed silent (" +
-                                       streams + ")"));
-        if (rounds > 1) out.set("rounds_attempted", Json::integer(round));
-        return out;
-      }
-
-      const std::string language = arg_string(request, "language");
-      Transcript transcript = recognize_wav(wav_path, language, true);
-      // Which tier produced the answer. The local engine ships with the machine and
-      // costs nothing, so it always goes first; a service is consulted only when it
-      // had nothing to say, because on a machine with no recognizer for the
-      // challenge's language that is exactly what it will say.
+      // First the challenge's own clip: it is reachable as a plain HTTPS GET, it
+      // needs no synthesized input and no capture window, and it cannot suffer the
+      // "played nothing" ambiguity that a render-endpoint capture can. Only the
+      // service tier can use it, because the local engine wants samples and
+      // decoding a compressed clip is not something this build does.
+      //
+      // Then the sound card, unchanged. That is the route the local engine needs,
+      // and it is also what runs when no service is configured.
+      Transcript transcript;
       std::string solved_by = "local";
+      const std::string language = arg_string(request, "language");
       const SolveApi api = resolve_solve_api(arg_string(request, "key"),
                                              session.captcha_api_key);
-      if (transcript.digits.empty() && !api.provider.empty()) {
-        // The service wants a small upload, and the render endpoint's 44.1 kHz stereo
-        // is neither small nor necessary for speech.
-        const std::string speech_path = wav_path + ".16k.wav";
-        std::string convert_error;
-        std::string api_digits;
-        std::string api_error;
-        if (!write_speech_wav(speech_path, captured, 16000, &convert_error)) {
-          out.set("api", Json::string(convert_error));
-        } else if (solve_audio_api(api, speech_path,
-                                   language.empty() ? std::string("en") : language,
-                                   &api_digits, &api_error)) {
-          transcript.digits = api_digits;
-          transcript.text = api_digits;
-          transcript.confidence = 1.0;
-          // The local engine's failure has been answered, so it is no longer the
-          // verdict. Leaving `ok` false here would report the local error and never
-          // use the answer the service just gave.
-          transcript.ok = true;
-          transcript.error.clear();
-          solved_by = "api";
-        } else {
-          out.set("api", Json::string(api_error));
+
+      bool from_clip = false;
+      if (session.cdp_enabled && !api.provider.empty()) {
+        std::string clip_url;
+        std::string url_error;
+        if (read_audio_url(session, &clip_url, &url_error)) {
+          out.set("audio_url", Json::string(clip_url));
+          const std::string clip_path = wav_path + ".clip";
+          long long clip_bytes = 0;
+          std::string download_error;
+          if (download_to_file(clip_url, clip_path, &clip_bytes, &download_error)) {
+            std::string api_digits;
+            std::string api_error;
+            if (solve_audio_api(api, clip_path,
+                                language.empty() ? std::string("en") : language,
+                                &api_digits, &api_error)) {
+              transcript.digits = api_digits;
+              transcript.text = api_digits;
+              transcript.confidence = 1.0;
+              // The service answered, so the local engine's silence is not the
+              // verdict -- the same correction the loopback path makes below.
+              transcript.ok = true;
+              solved_by = "api";
+              from_clip = true;
+              out.set("audio_source", Json::string("url"));
+              out.set("clip_bytes", Json::integer(clip_bytes));
+            } else {
+              out.set("api", Json::string(api_error));
+            }
+            ::DeleteFileA(clip_path.c_str());
+          } else {
+            out.set("audio_url_error", Json::string(download_error));
+          }
         }
-        ::DeleteFileA(speech_path.c_str());
+      }
+
+      if (!from_clip) {
+        // The challenge does not play itself. reCAPTCHA's audio frame keeps the clip
+        // behind its own play control, and until that control is pressed the audio
+        // element holds an open render session that produces nothing -- which is why a
+        // capture taken without this click measures `active peak 0.0000` and is
+        // indistinguishable from a page that simply stayed silent.
+        //
+        // The recorder starts first so that pressing the control lands inside the
+        // capture window rather than before it.
+        CaptureResult captured;
+        std::thread recorder([&captured, seconds, &wav_path]() {
+          captured = capture_loopback(seconds, std::string(), wav_path);
+        });
+        Sleep(300);
+
+        const int play_index = latest.play_button_index;
+        if (play_index >= 0) {
+          std::string play_error;
+          if (click_node(session, play_index, &play_error)) {
+            out.set("play", Json::string("pressed the challenge's play control"));
+          } else {
+            out.set("play", Json::string("the play control could not be pressed: " + play_error));
+          }
+        } else {
+          // A challenge shaped differently, or one that autoplays. Asking for a replay is
+          // the best available way to put the start of the clip inside the window.
+          out.set("play", Json::string("the challenge exposes no play control"));
+          if (latest.refresh_button_index >= 0) {
+            std::string click_error;
+            click_node(session, latest.refresh_button_index, &click_error);
+          }
+        }
+        recorder.join();
+
+        out.set("device", Json::string(captured.device_name));
+        out.set("captured_seconds", Json::number(captured.seconds));
+        out.set("peak", Json::number(captured.peak));
+        out.set("rms", Json::number(captured.rms));
+        // Whether a stream existed at all, which the samples alone cannot say.
+        const std::string streams = stream_summary();
+        out.set("streams", Json::string(streams));
+        if (!captured.ok) {
+          out.set("solved", Json::boolean(false));
+          out.set("detail", Json::string(captured.error));
+          if (rounds > 1) out.set("rounds_attempted", Json::integer(round));
+          return out;
+        }
+        if (captured.peak <= 0.0) {
+          out.set("solved", Json::boolean(false));
+          out.set("detail", Json::string("the challenge played nothing: " +
+                                         captured.device_name + " stayed silent (" +
+                                         streams + ")"));
+          if (rounds > 1) out.set("rounds_attempted", Json::integer(round));
+          return out;
+        }
+
+        transcript = recognize_wav(wav_path, language, true);
+        // Which tier produced the answer. The local engine ships with the machine and
+        // costs nothing, so it always goes first; a service is consulted only when it
+        // had nothing to say, because on a machine with no recognizer for the
+        // challenge's language that is exactly what it will say.
+        if (transcript.digits.empty() && !api.provider.empty()) {
+          // The service wants a small upload, and the render endpoint's 44.1 kHz stereo
+          // is neither small nor necessary for speech.
+          const std::string speech_path = wav_path + ".16k.wav";
+          std::string convert_error;
+          std::string api_digits;
+          std::string api_error;
+          if (!write_speech_wav(speech_path, captured, 16000, &convert_error)) {
+            out.set("api", Json::string(convert_error));
+          } else if (solve_audio_api(api, speech_path,
+                                     language.empty() ? std::string("en") : language,
+                                     &api_digits, &api_error)) {
+            transcript.digits = api_digits;
+            transcript.text = api_digits;
+            transcript.confidence = 1.0;
+            // The local engine's failure has been answered, so it is no longer the
+            // verdict. Leaving `ok` false here would report the local error and never
+            // use the answer the service just gave.
+            transcript.ok = true;
+            transcript.error.clear();
+            solved_by = "api";
+          } else {
+            out.set("api", Json::string(api_error));
+          }
+          ::DeleteFileA(speech_path.c_str());
+        }
       }
       out.set("solved_by", Json::string(solved_by));
       // A failed transcription is the interesting case, and it cannot be diagnosed from
       // the samples alone -- too quiet, too short and wrong-language all look alike in
       // the numbers. `keep` leaves the recording behind so the caller can measure it.
-      if (arg_bool(request, "keep", false)) {
-        out.set("wav", Json::string(wav_path));
-      } else {
-        ::DeleteFileA(wav_path.c_str());
+      // Only the capture route has a recording to keep.
+      if (!from_clip) {
+        if (arg_bool(request, "keep", false)) {
+          out.set("wav", Json::string(wav_path));
+        } else {
+          ::DeleteFileA(wav_path.c_str());
+        }
       }
       if (!transcript.text.empty()) out.set("transcript", Json::string(transcript.text));
       if (!transcript.digits.empty()) out.set("heard", Json::string(transcript.digits));
@@ -1318,6 +1444,208 @@ Json cmd_screenshot(Session& session, const Json& request) {
   return out;
 }
 
+// Turns a reference into an absolute URL against the document it was written in.
+//
+// This is not optional politeness. The DevTools tree hands back the attribute
+// exactly as it was authored, so a challenge that writes src="/payload" -- which
+// is what a plain <audio src> in an iframe looks like -- arrives as a path, and
+// nothing outside the page can fetch a path. The document node carries the base
+// to resolve it against, so this costs no page script.
+std::string resolve_url(const std::string& base, const std::string& reference) {
+  if (reference.empty() || base.empty()) return reference;
+  std::string head;
+  head.reserve(8);
+  for (const char c : reference) {
+    if (head.size() >= 8) break;
+    head.push_back(c >= 'A' && c <= 'Z' ? static_cast<char>(c + 32) : c);
+  }
+  // Already absolute, or not something a downloader could ever fetch. The caller
+  // reports the latter as a clip it cannot reach.
+  if (head.rfind("http://", 0) == 0 || head.rfind("https://", 0) == 0 ||
+      head.rfind("data:", 0) == 0 || head.rfind("blob:", 0) == 0) {
+    return reference;
+  }
+  const std::size_t scheme_end = base.find("://");
+  if (scheme_end == std::string::npos) return reference;
+  const std::size_t authority_start = scheme_end + 3;
+  const std::size_t authority_end = base.find('/', authority_start);
+  const std::string origin =
+      base.substr(0, authority_end == std::string::npos ? base.size() : authority_end);
+  if (reference.rfind("//", 0) == 0) return base.substr(0, scheme_end + 1) + reference;
+  if (reference[0] == '/') return origin + reference;
+  // A path relative to the document, so its own last segment is replaced. The
+  // query and fragment of the document are not part of the directory.
+  std::string directory = base;
+  const std::size_t cut = directory.find_first_of("?#");
+  if (cut != std::string::npos) directory.erase(cut);
+  const std::size_t slash = directory.rfind('/');
+  directory = (slash == std::string::npos || slash < authority_start)
+                  ? origin + "/"
+                  : directory.substr(0, slash + 1);
+  return directory + reference;
+}
+
+// Walks a DOM.getDocument tree for the element a challenge keeps its clip in.
+// Both spellings are accepted: a source on the <audio> element itself, and a
+// nested <source> child, which is what a challenge uses when it offers the same
+// clip in more than one container.
+bool find_audio_src(const Json& node, const std::string& base, std::string* url) {
+  if (!node.is_object()) return false;
+  // A document node names the base every reference inside it resolves against,
+  // which is also how the walk learns the base of a frame it just descended into.
+  std::string here = base;
+  const Json* node_base = node.find("baseURL");
+  if (node_base != nullptr && node_base->is_string() && !node_base->as_string().empty()) {
+    here = node_base->as_string();
+  }
+  const Json* name = node.find("nodeName");
+  const std::string tag = name != nullptr ? name->as_string() : std::string();
+  if (tag == "AUDIO" || tag == "SOURCE") {
+    const Json* attributes = node.find("attributes");
+    if (attributes != nullptr && attributes->is_array()) {
+      // CDP flattens attributes into [name, value, name, value, ...].
+      const std::vector<Json>& pairs = attributes->items();
+      for (size_t i = 0; i + 1 < pairs.size(); i += 2) {
+        if (pairs[i].as_string() != "src") continue;
+        const std::string value = pairs[i + 1].as_string();
+        if (!value.empty()) {
+          *url = resolve_url(here, value);
+          return true;
+        }
+      }
+    }
+  }
+  const Json* children = node.find("children");
+  if (children != nullptr && children->is_array()) {
+    for (const Json& child : children->items()) {
+      if (find_audio_src(child, here, url)) return true;
+    }
+  }
+  // A same-site frame arrives as a contentDocument on the frame element, so a
+  // challenge served from the page's own domain is reached without attaching to
+  // anything at all.
+  const Json* content = node.find("contentDocument");
+  if (content != nullptr && find_audio_src(*content, here, url)) return true;
+  const Json* shadows = node.find("shadowRoots");
+  if (shadows != nullptr && shadows->is_array()) {
+    for (const Json& shadow : shadows->items()) {
+      if (find_audio_src(shadow, here, url)) return true;
+    }
+  }
+  return false;
+}
+
+// Reads the clip's URL out of the page.
+//
+// Two shapes have to be handled, and which one appears depends on the site rather
+// than on the challenge. When the challenge's frame is same-site with the page --
+// which is what a vendor's own demo page looks like -- Chromium keeps it in the
+// page's renderer and the frame's document arrives inside DOM.getDocument as a
+// contentDocument, so one call on the page session is enough. DOM.getDocument
+// needs no DOM.enable and no Runtime.enable, so nothing about the page's own
+// view of itself changes.
+//
+// On a real third-party site the frame is cross-site, so Chromium gives it a
+// renderer of its own and the page's tree cannot contain it. There the frame is a
+// target in its own right and the tree has to be asked for on a session attached
+// to it. Both paths are tried, in that order, because guessing wrong is silent.
+bool read_audio_url(Session& session, std::string* url, std::string* error) {
+  if (!session.cdp_enabled || !session.cdp.connected()) {
+    if (error != nullptr) {
+      *error = "this session has no DevTools pipe, so the page's DOM cannot be read";
+    }
+    return false;
+  }
+  std::string attach_error;
+  if (!session.cdp.attach_to_page(&attach_error)) {
+    if (error != nullptr) *error = attach_error;
+    return false;
+  }
+
+  Json params = Json::object();
+  params.set("depth", Json::integer(-1));
+  params.set("pierce", Json::boolean(true));
+
+  std::string call_error;
+  Json document;
+  if (session.cdp.call("DOM.getDocument", params, session.cdp.page_session(), &document,
+                       &call_error)) {
+    const Json* root = document.find("root");
+    if (root != nullptr && find_audio_src(*root, std::string(), url) && !url->empty()) {
+      return true;
+    }
+  }
+
+  // Out-of-process frame: find it by name and ask it directly. Only challenge
+  // frames are attached to, so a page full of advertising iframes does not turn
+  // one DOM read into a dozen sessions.
+  Json targets;
+  if (!session.cdp.call("Target.getTargets", Json::object(), std::string(), &targets,
+                        &call_error)) {
+    if (error != nullptr) *error = call_error;
+    return false;
+  }
+  const Json* infos = targets.find("targetInfos");
+  if (infos == nullptr || !infos->is_array()) {
+    if (error != nullptr) *error = "the browser listed no targets";
+    return false;
+  }
+  // Frames named after a known challenge vendor go first, because that is what the
+  // three providers this control plane knows about look like and it is the cheap
+  // common case. The rest are tried too, in the order the browser listed them,
+  // because the set of vendors is not something this code gets to decide: a
+  // provider can rename its path, and a frame named after nothing at all can still
+  // be the one holding the clip. Filtering to the known names alone silently
+  // refuses those, which is how this was first written and how it was caught.
+  std::vector<std::string> named;
+  std::vector<std::string> rest;
+  for (const Json& info : infos->items()) {
+    const Json* type = info.find("type");
+    const Json* frame_url = info.find("url");
+    const Json* id = info.find("targetId");
+    if (type == nullptr || frame_url == nullptr || id == nullptr) continue;
+    if (type->as_string() != "iframe") continue;
+    const std::string address = frame_url->as_string();
+    if (address.empty() || address == "about:blank") continue;
+    if (address.find("recaptcha") != std::string::npos ||
+        address.find("hcaptcha") != std::string::npos ||
+        address.find("challenges.cloudflare.com") != std::string::npos) {
+      named.push_back(id->as_string());
+    } else {
+      rest.push_back(id->as_string());
+    }
+  }
+  named.insert(named.end(), rest.begin(), rest.end());
+  // Every frame costs a tree read, so the search stops at a dozen. A challenge
+  // frame is not the thirteenth iframe on a page, and if it somehow were, the
+  // sound card is still there to fall back on.
+  const size_t limit = named.size() < 12 ? named.size() : 12;
+  for (size_t i = 0; i < limit; ++i) {
+    Json attach = Json::object();
+    attach.set("targetId", Json::string(named[i]));
+    attach.set("flatten", Json::boolean(true));
+    Json attached;
+    if (!session.cdp.call("Target.attachToTarget", attach, std::string(), &attached,
+                          &call_error)) {
+      continue;
+    }
+    const Json* frame_session = attached.find("sessionId");
+    if (frame_session == nullptr) continue;
+    Json frame_document;
+    if (session.cdp.call("DOM.getDocument", params, frame_session->as_string(),
+                         &frame_document, &call_error)) {
+      const Json* frame_root = frame_document.find("root");
+      if (frame_root != nullptr && find_audio_src(*frame_root, std::string(), url) &&
+          !url->empty()) {
+        return true;
+      }
+    }
+  }
+
+  if (error != nullptr) *error = "the page holds no audio element with a source";
+  return false;
+}
+
 // The escape hatch: one DevTools command, straight through.
 //
 // The rest of this control plane exists because the accessibility tree cannot
@@ -1345,14 +1673,22 @@ Json cmd_cdp(Session& session, const Json& request) {
     return out;
   }
 
-  // "browser" addresses the browser itself (Target.*, Browser.*). Anything else
-  // is page-scoped and needs the session id from an attach.
+  // "browser" addresses the browser itself (Target.*, Browser.*), "page" -- or
+  // nothing -- means the page this session is attached to, and anything else is
+  // taken as a session id the caller already holds. That last form is the only
+  // way to reach a target the page's own tree does not contain, such as a
+  // cross-site challenge frame reached through Target.attachToTarget: its
+  // reply carries the sessionId, and this is where it goes back in.
   const std::string scope = arg_string(request, "session");
   std::string session_id;
-  if (scope != "browser") {
+  if (scope == "browser") {
+    // The browser scope is addressed without a session id.
+  } else if (scope.empty() || scope == "page") {
     std::string attach_error;
     if (!session.cdp.attach_to_page(&attach_error)) return failure(attach_error);
     session_id = session.cdp.page_session();
+  } else {
+    session_id = scope;
   }
 
   const Json* params = request.find("params");

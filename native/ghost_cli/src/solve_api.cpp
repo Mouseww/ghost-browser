@@ -294,4 +294,126 @@ bool solve_recaptcha_api(const SolveApi& api, const std::string& site_key,
   return true;
 }
 
+bool download_to_file(const std::string& url, const std::string& path,
+                      long long* bytes, std::string* error) {
+  const std::wstring wide_url = widen(url);
+  URL_COMPONENTS parts;
+  std::memset(&parts, 0, sizeof(parts));
+  parts.dwStructSize = sizeof(parts);
+  parts.dwSchemeLength = static_cast<DWORD>(-1);
+  parts.dwHostNameLength = static_cast<DWORD>(-1);
+  parts.dwUrlPathLength = static_cast<DWORD>(-1);
+  parts.dwExtraInfoLength = static_cast<DWORD>(-1);
+  if (::WinHttpCrackUrl(wide_url.c_str(), 0, 0, &parts) == FALSE) {
+    if (error != nullptr) *error = "the clip URL could not be parsed: " + url;
+    return false;
+  }
+  const std::wstring host(parts.lpszHostName, parts.dwHostNameLength);
+  std::wstring request_path(parts.lpszUrlPath, parts.dwUrlPathLength);
+  if (parts.dwExtraInfoLength > 0) {
+    request_path.append(parts.lpszExtraInfo, parts.dwExtraInfoLength);
+  }
+
+  HINTERNET session = ::WinHttpOpen(L"ghost", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+  if (session == nullptr) {
+    if (error != nullptr) *error = "WinHttpOpen failed";
+    return false;
+  }
+  ::WinHttpSetTimeouts(session, 15000, 15000, 60000, 60000);
+
+  HINTERNET connect = ::WinHttpConnect(session, host.c_str(), parts.nPort, 0);
+  if (connect == nullptr) {
+    ::WinHttpCloseHandle(session);
+    if (error != nullptr) *error = "could not reach " + narrow(host);
+    return false;
+  }
+
+  const DWORD flags =
+      parts.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0;
+  HINTERNET request =
+      ::WinHttpOpenRequest(connect, L"GET", request_path.c_str(), nullptr,
+                           WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+  if (request == nullptr) {
+    ::WinHttpCloseHandle(connect);
+    ::WinHttpCloseHandle(session);
+    if (error != nullptr) *error = "could not open the request";
+    return false;
+  }
+  // A challenge's clip often arrives through a redirect to a CDN, and the default
+  // policy is to refuse one that leaves the host.
+  DWORD redirect = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+  ::WinHttpSetOption(request, WINHTTP_OPTION_REDIRECT_POLICY, &redirect,
+                     sizeof(redirect));
+
+  HANDLE file = ::CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) {
+    ::WinHttpCloseHandle(request);
+    ::WinHttpCloseHandle(connect);
+    ::WinHttpCloseHandle(session);
+    if (error != nullptr) *error = "could not create " + path;
+    return false;
+  }
+
+  bool ok = false;
+  long long total = 0;
+  DWORD status = 0;
+  if (::WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                           WINHTTP_NO_REQUEST_DATA, 0, 0, 0) != FALSE &&
+      ::WinHttpReceiveResponse(request, nullptr) != FALSE) {
+    DWORD length = sizeof(status);
+    ::WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                          WINHTTP_HEADER_NAME_BY_INDEX, &status, &length,
+                          WINHTTP_NO_HEADER_INDEX);
+    if (status >= 200 && status < 300) {
+      ok = true;
+      // No size cap here, unlike the service replies: a spoken clip is a real
+      // audio file, and truncating it would corrupt exactly the bytes the service
+      // is being asked to listen to.
+      for (;;) {
+        DWORD available = 0;
+        if (::WinHttpQueryDataAvailable(request, &available) == FALSE ||
+            available == 0) {
+          break;
+        }
+        std::string chunk(available, '\0');
+        DWORD read = 0;
+        if (::WinHttpReadData(request, chunk.data(), available, &read) == FALSE) {
+          ok = false;
+          break;
+        }
+        DWORD written = 0;
+        if (read > 0 &&
+            (::WriteFile(file, chunk.data(), read, &written, nullptr) == FALSE ||
+             written != read)) {
+          ok = false;
+          break;
+        }
+        total += read;
+      }
+    } else if (error != nullptr) {
+      *error = "the clip answered HTTP " + std::to_string(status);
+    }
+  } else if (error != nullptr) {
+    *error = "the request for " + narrow(host) + " did not complete";
+  }
+
+  ::CloseHandle(file);
+  ::WinHttpCloseHandle(request);
+  ::WinHttpCloseHandle(connect);
+  ::WinHttpCloseHandle(session);
+
+  if (ok && total == 0) {
+    ok = false;
+    if (error != nullptr) *error = "the clip came back empty";
+  }
+  if (!ok) {
+    ::DeleteFileA(path.c_str());
+    return false;
+  }
+  if (bytes != nullptr) *bytes = total;
+  return true;
+}
+
 }  // namespace ghost

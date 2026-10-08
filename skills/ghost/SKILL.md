@@ -70,19 +70,26 @@ tree you read yourself too early. If you want to watch without acting, use
 `waited_ms`. A challenge that is only being verified needs time, not input.
 
 - `state: solved` — the widget is gone; the challenge is answered.
-- `state: visual` — an image challenge is open. **You cannot solve this, and neither
-  can the browser yet.** Report it to the user instead of burning attempts.
+- `state: visual` — an image challenge is open. **The browser cannot recognise it.**
+  With a solving service configured, `action="solve-token"` has the service rebuild the
+  challenge and writes the token into the page; without one, report it to the user
+  instead of burning attempts.
 - `state: audio` — an audio challenge is open. Call `ghost_captcha` again with
-  `action="solve-audio"`: it records what the machine actually played, transcribes the
-  digits and types them back. Give it `language` (e.g. `en-US`) — the machine's speech
-  recognisers are installed per language, and it may not have one for the challenge's.
+  `action="solve-audio"`. With a service key it reads the clip's own address out of the
+  page and fetches it; otherwise it records what the machine actually played, transcribes
+  the digits and types them back. Give it `language` (e.g. `en-US`) — the machine's
+  speech recognisers are installed per language, and it may not have one for the
+  challenge's.
 
 Cloudflare Turnstile usually reaches `solved` from the click alone, so
 `ghost_captcha` can clear a Cloudflare interstitial on its own. hCaptcha and
 reCAPTCHA escalate; for reCAPTCHA the audio route finishes the job, and for hCaptcha
 the honest answer is that it stops there.
 
-When `solve-audio` comes back empty, read the response before retrying:
+When `solve-audio` comes back empty, read the response before retrying. If you want to
+know which route was tried, `action="audio-url"` reports on its own whether the clip's
+address could be read out of the page and fetched — a `blob:` clip, or a session started
+with `--no-cdp`, is why it would not be:
 
 - `play` — whether the challenge's play control was pressed. The audio challenge does
   not start itself, and an unpressed control looks exactly like a silent page.

@@ -319,13 +319,14 @@ Reads the human-verification challenge on the page and, when asked, clicks it.
 
 | field | default | meaning |
 |---|---|---|
-| `action` | `solve` | `detect` reads only; `wait` reads and watches without clicking; `solve` also clicks the checkbox and watches; `solve-audio` records the audio challenge, transcribes it and answers it; `solve-token` has a solving service answer it and writes the token into the page |
+| `action` | `solve` | `detect` reads only; `wait` reads and watches without clicking; `solve` also clicks the checkbox and watches; `solve-audio` records the audio challenge, transcribes it and answers it; `solve-token` has a solving service answer it and writes the token into the page; `audio-url` reads the challenge's own clip address out of the page and fetches it |
 | `timeout` | `30000` | milliseconds to keep watching after the click, or for `wait` to keep watching at all |
 | `wait_ms` | `3000` | how long the *first* look may keep looking for a challenge to appear; `0` means a single sample |
 | `seconds` | `10` | `solve-audio` only: how long to record, clamped to 2–30 |
 | `language` | `en` | `solve-audio` only: the recogniser language and the solving service's hint |
 | `keep` | `false` | `solve-audio` only: keep the recording and return its path as `wav`, instead of deleting it |
 | `rounds` | `1` | `solve-audio` only: how many audio clips the command is willing to answer in one call, clamped to 1–5. reCAPTCHA often rejects a correct answer once and plays the next clip; a second round answers that clip too instead of reporting a single-round failure |
+| `path` | a temporary file | `audio-url` only: where to write the fetched clip |
 
 Returns `provider`, `state`, `detail`, and when they are known `site_key`, `page_url`,
 `frame_url` and `challenge_token`; `solve` adds `clicked`, `input` and `elapsed_ms`.
@@ -372,6 +373,26 @@ tree (redraws invalidate indexes), and starts the next clip's recording. The rep
 then also carries `rounds_attempted` — how many clips were answered — and `solved`
 reflects the state after the last one. A single-round call keeps the reply shape it
 always had and adds no round fields.
+
+`audio-url` reads the address of the clip the challenge is about to play and fetches it.
+It is the route `solve-audio` takes when a solving service is configured, so with it
+neither the sound card nor the local recogniser is involved. It returns `found`, `url`,
+`fetched`, `bytes`, and `path` when `keep` is set. Three things are worth knowing:
+
+- The clip usually lives in a frame with **a process of its own**, which is why the page
+  tree does not contain it. The command asks the browser for its targets and attaches to
+  the frames directly. A frame whose address names a known vendor is tried first and the
+  rest are tried after it, because the set of vendors is not something this code gets to
+  decide.
+- The address it reads is the attribute as it was authored — often `/clip.wav`. The
+  document node carries `baseURL`, so the command resolves it against that itself, and
+  never runs a line of page script to do it.
+- Some challenges keep the clip in the renderer as a `blob:` or `data:` URL. Nothing
+  outside the page can fetch that, so `found` is true with `fetched` false and a `detail`
+  that says so; `solve-audio` then falls back to recording.
+
+It needs the DevTools channel, so a session started with `--no-cdp` reports
+`found: false` and names the missing pipe rather than pretending there was no clip.
 
 The third tier is off unless a key is configured. There is no built-in key. The key is
 taken from `GHOST_CAPTCHA_KEY`, or from `captcha_api_key` in the profile the server was
@@ -444,7 +465,7 @@ do not enter the page's own world at all.
 |---|---|---|
 | `method` | *required* | the DevTools method, e.g. `Page.getFrameTree` |
 | `params` | `{}` | the method's parameters, passed through unchanged |
-| `session` | `""` | `"browser"` addresses the browser; anything else is page-scoped |
+| `session` | `""` | `"browser"` addresses the browser, `"page"` or empty the page; any other value is used as the session id you already hold |
 
 Returns `ok`, `method` and `result` — the protocol's own reply, unmodified.
 
@@ -454,7 +475,9 @@ expects an event stream will look like it returned nothing.
 
 Page-scoped calls attach to the page target first. A cross-site iframe is a separate
 target, so you need `Target.attachToTarget` yourself — `Page.getFrameTree` on the page
-target lists only the main frame.
+target lists only the main frame. Pass the `sessionId` that call returns straight back
+as `session` to talk to that frame; that is exactly how `captcha action=audio-url`
+reaches a clip held in a frame with a process of its own.
 
 > **The renderer has to be visible.** In a session with no foreground window Chromium
 > marks the renderer hidden, and a hidden renderer both builds no accessibility tree

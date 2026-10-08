@@ -379,7 +379,7 @@ python tools\serve_check.py --ghost "$env:TEMP\ghost.exe"
 ```
 
 The first two print a per-check table and end with `34 checks, 0 failed`; the
-control plane check ends with `17 checks, 0 failed`. The harness run shows
+control plane check ends with `19 checks, 0 failed`. The harness run shows
 `[GAP]` (not `[PASS]`) on `hardwareConcurrency` and `deviceMemory`, because the
 sandbox makes those structurally unreachable — a gap, not a failure.
 
@@ -453,15 +453,18 @@ utility processes are reachable.
 ## 9. Human-verification challenges
 
 The `captcha` command on the control plane reads the challenge and, when it can,
-clears it. It works through the accessibility tree rather than the DOM, so there is
-no CDP involved and nothing is injected. Send it with `ghost call` to a session that
-is already running (`ghost serve --id work` in another window):
+clears it. It reads through the accessibility tree by default, so nothing is injected
+into the page. The two routes that must touch the DOM — `solve-token` writes a hidden
+field, `audio-url` reads a clip address — go over the DevTools channel instead, and
+only when the session has one. Send it with `ghost call` to a session that is already
+running (`ghost serve --id work` in another window):
 
 ```
 ghost call --id work "{\"cmd\":\"captcha\"}"                          # detect, then try to solve
 ghost call --id work "{\"cmd\":\"captcha\",\"action\":\"detect\"}"    # only report
 ghost call --id work "{\"cmd\":\"captcha\",\"action\":\"wait\",\"timeout\":30000}"
 ghost call --id work "{\"cmd\":\"captcha\",\"action\":\"solve-audio\",\"language\":\"en-US\"}"
+ghost call --id work "{\"cmd\":\"captcha\",\"action\":\"audio-url\"}"    # where is the clip?
 ghost call --id work "{\"cmd\":\"captcha\",\"action\":\"solve-token\"}"   # needs a service key
 ```
 
@@ -510,7 +513,7 @@ A solved Cloudflare Turnstile looks like this:
 | `solved` | the widget is gone | continue |
 
 What actually happens today, measured against the three real challenges
-([`tools/captcha_check.py`](tools/captcha_check.py), **33 checks, 0 failed**):
+([`tools/captcha_check.py`](tools/captcha_check.py), **35 checks, 0 failed**):
 
 | challenge | result |
 |---|---|
@@ -528,11 +531,17 @@ foreground window cannot deliver synthesized input at all:
 
 ### Solving the audio challenge
 
-`action=solve-audio` takes the route that does not need to see the page: it opens
-the audio challenge, starts recording the default output device in loopback mode,
-presses the challenge's own play control, transcribes the digits and types them
-back. Nothing is downloaded and no URL is parsed — what gets transcribed is what
-the machine actually played.
+`action=solve-audio` answers the challenge on the machine: it opens the audio
+challenge, starts recording the default output device in loopback mode, presses the
+challenge's own play control, transcribes the digits and types them back. What gets
+transcribed is what the machine actually played — no URL is parsed, and no page script
+runs.
+
+When a solving service is configured it takes a shorter route first: it reads the clip's
+own address out of the page, fetches it, and hands the file over — see
+[Reading the clip's own URL](#reading-the-clips-own-url). Recording is what remains when
+there is no service key, or when the clip turns out to be a `blob:` URL that only the
+page can read.
 
 ```json
 {
@@ -575,6 +584,47 @@ answer did not come from the local recogniser. `solved_by` says where it came fr
 |---|---|
 | `local` | the digits came from the Windows speech recogniser on this machine |
 | `api` | the local recogniser had nothing, so the recording went to a solving service |
+
+### Reading the clip's own URL
+
+`action=audio-url` answers a narrower question — *where is the clip?* — and is worth
+knowing about on its own, because it is the only route that needs no sound card at all.
+
+```powershell
+ghost call --id work "{\"cmd\":\"captcha\",\"action\":\"audio-url\",\"keep\":true}"
+```
+
+```json
+{
+  "found": true,
+  "url": "https://www.google.com/recaptcha/api2/payload?p=...&k=...",
+  "fetched": true,
+  "bytes": 33431,
+  "path": "C:\\Users\\you\\AppData\\Local\\Temp\\ghost-clip-1234.bin"
+}
+```
+
+Three things make this less obvious than it sounds.
+
+- **The clip is usually not in the page's tree.** reCAPTCHA's audio lives in a frame
+  with a process of its own, so a walk of the page's own DOM comes back empty. The
+  command asks the browser for its targets and attaches to the frames directly. A frame
+  whose address names a known vendor is tried first and the rest are tried after it,
+  because the set of vendors is not something this code gets to decide.
+- **The address is the attribute as it was authored**, often just `/clip.wav`. The
+  document node carries `baseURL`, so the command resolves it itself. It never runs a
+  line of page script to do it, and `Runtime.enable` is never called.
+- **Some clips are `blob:` URLs.** Those live in the renderer and nothing outside the
+  page can fetch them, so `found` is true with `fetched` false and a `detail` saying so.
+  That is not a failure — it is the signal to fall back to recording.
+
+The route needs the DevTools channel, so a session started with `--no-cdp` reports
+`found: false` and names the missing pipe rather than claiming the page had no clip.
+
+[`tools/audio_url_check.py`](tools/audio_url_check.py) covers all of this against a local
+stand-in: a frame on a second origin (so it really does get a process of its own), a
+frame whose address is named like a vendor's, a page with no audio element at all, and a
+`--no-cdp` session — **13 checks, 0 failed**.
 
 ### When there is no recogniser for the language
 

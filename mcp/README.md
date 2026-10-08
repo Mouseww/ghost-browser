@@ -79,7 +79,7 @@ but `ghost serve` does not exist there yet.
 | `ghost_type` | `text` | Type into the focused field |
 | `ghost_key` | `key` \| `keys[]` | Press a key or a combination |
 | `ghost_scroll` | `delta?`, `css_x?`, `css_y?` | Scroll |
-| `ghost_captcha` | `action?` (`detect`/`wait`/`solve`/`solve-audio`/`solve-token`), `timeout?`, `wait_ms?`, `seconds?`, `language?`, `keep?`, `rounds?`, `key?` | Read, watch, click, record-and-answer, or have a service answer a human-verification challenge |
+| `ghost_captcha` | `action?` (`detect`/`wait`/`solve`/`solve-audio`/`solve-token`/`audio-url`), `timeout?`, `wait_ms?`, `seconds?`, `language?`, `keep?`, `rounds?`, `key?`, `path?` | Read, watch, click, record-and-answer, read the clip's own URL, or have a service answer a human-verification challenge |
 | `ghost_cdp` | `method`, `params?`, `session?` | Send one DevTools protocol call through the pipe channel |
 | `ghost_screenshot` | — | Capture the window as PNG |
 | `ghost_close` | — | Close the browser and stop the server |
@@ -105,14 +105,16 @@ sample) before it will say `provider: none`, and reports `appeared_ms`. `action=
 clicks nothing and reports `appeared`, `appeared_ms`, `cleared` and `waited_ms` — use it
 when a challenge is being verified and needs time rather than input.
 
-The audio challenge is the automatable one: `action="solve-audio"` records what the
-machine actually played, transcribes the digits and types them back, and says whether
-the answer came from this machine (`solved_by: local`) or from a solving service
-(`api`). Pass `language` — speech recognisers are installed per language and the
-machine may not have one for the challenge's. A solving service is used only when the
-local recogniser comes back empty **and** `GHOST_CAPTCHA_KEY` (or `captcha_api_key` in
-the profile) is set; with no key the service tier is simply off. `keep=true` returns
-the recording's path, which is what you want when the transcription fails.
+The audio challenge is the automatable one: `action="solve-audio"` answers it, and says
+whether the answer came from this machine (`solved_by: local`) or from a solving service
+(`api`). With a service key it first reads the clip's own address out of the page and
+fetches it, which needs neither the sound card nor a recogniser; `action="audio-url"`
+reports on that step alone. Otherwise it records what the machine actually played,
+transcribes the digits and types them back — pass `language`, because speech recognisers
+are installed per language and the machine may not have one for the challenge's. A
+solving service is used only when `GHOST_CAPTCHA_KEY` (or `captcha_api_key` in the
+profile) is set; with no key the service tier is simply off. `keep=true` returns the
+recording's path, which is what you want when the transcription fails.
 
 Every click reports `input`: `synthesized` when a real `SendInput` carried it,
 `accessibility` when it went through UI Automation instead. The second happens when
